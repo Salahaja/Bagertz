@@ -1,4 +1,4 @@
-# Bagertz (v1.0.0)
+# Bagertz (v1.1.0)
 
 Shows how many of an item your **other characters** are carrying, right in the item's tooltip — including characters on a **different WoW account**, which is the part nothing else does.
 
@@ -26,7 +26,7 @@ That also makes it safe for dual-boxing specifically. The obvious alternative �
 
 ## Pairing, and what the password actually protects
 
-Addon messages are broadcast to the whole PARTY/RAID, so a shared password decides whose data you accept and who accepts yours. Set the same word on both boxes:
+Addon messages are broadcast to everyone on the channel, so a shared password decides whose data you accept and who accepts yours. Set the same word on both boxes:
 
 ```
 /bz password <word>
@@ -43,25 +43,60 @@ Two things limit the exposure anyway:
 
 In the normal dual-boxing case your two characters are in a party by themselves, so a PARTY broadcast reaches exactly your other box and nobody else.
 
+### Party and guild
+
+Beacons go out on every channel you can reach - party or raid, and guild if you are in one - so the two boxes can find each other **without being grouped**. The inventory itself is different: it goes only to the channel a paired box was actually heard on. Being in a large guild therefore does not mean every sync reaches the whole guild; once your other box has answered in the party, that is where the data goes.
+
+Turn the guild channel off with `/bz guild off` if you would rather the boxes only find each other while grouped.
+
 ## Usage
 
 Set the same password on both boxes, put the two characters in a party, and they'll find each other within about 20 seconds. Then hover any item.
 
 ```
-/bz                     list known characters and when each was last updated
+/bz                     status, plus every known character and when each was updated
+/bz account <name>      label this account (see below) - do this on each box
 /bz password <word>     set the shared secret (same word on both boxes)
 /bz password off        stop sharing entirely
+/bz guild on|off        whether the boxes may find each other via guild chat
 /bz sync                force a sync right now instead of waiting
+/bz selftest            prove whether the channel delivers messages intact
 /bz forget <name>       drop one cached character
 /bz clear               drop every cached character
-/bz debug               verbose logging, for working out why a sync isn't happening
+/bz debug               verbose logging, for working out why a sync is not happening
 ```
 
 `/bz password` with no argument tells you *whether* one is set — it never prints it back, since chat frames get logged and streamed.
 
+### What a tooltip looks like
+
+```
+MAIN/Salahaja: 6 in bags, 40 in bank (46)
+ALT/Salabeard: 5 in bags
+```
+
+Your own character is listed first and in green, since it's usually what you're comparing against. Bags and bank are shown separately with a combined total, and a location with none of the item is simply omitted rather than padded with a zero.
+
+### Account labels
+
+WoW gives addons **no way to read your account name** — it exists only as a folder name on disk. So `/bz account <name>` sets a label for whichever account you're logged into, stored in that account's own saved variables and sent along with its data. Run it once on each box:
+
+```
+/bz account MAIN
+/bz account ALT
+```
+
+Without a label the character name simply stands alone, rather than showing a dangling prefix.
+
+### If nothing is syncing
+
+`/bz` leads with a status block — whether a password is set, which channels are reachable, which paired boxes have been heard, and per-session counts of messages sent, received and rejected. Those counts localise the problem: sending with nothing received means the other box isn't hearing you, while receiving where everything is rejected means the passwords differ.
+
+`/bz selftest` (with `/bz debug` on both boxes) sends a canary containing every character class the wire format depends on, and the other box prints what actually arrived next to what was sent. That's there because the first working version *wasn't* — the format used `|` as its field separator, which is WoW's own escape character for `|c`/`|r`/`|H`, and the chat pipeline mangled it. Every message was dropped in silence. The separator is now `~`.
+
 ## Known limitations
 
-- **Bags only, for now.** Bank contents are readable only while the bank frame is open, which needs its own "last seen at a bank" handling; that's the next piece rather than something quietly half-done here.
+- **Bank counts are a snapshot from the last bank visit.** Bank contents are readable only while the bank frame is open - away from a bank those containers report nothing at all. So the bank is scanned while you stand there and then kept. A character who has not visited a bank since installing this shows no bank count until they do.
 - **A character must be dual-boxed with you once** before it appears. There's no way to import one that never met your other box.
 - **Both boxes need this addon.** It syncs with itself, not with Bagnon or Bagshui.
 - **The counts are a snapshot** taken when the other box last sent, not a live feed. It re-sends when its bags change and it can see a paired box.

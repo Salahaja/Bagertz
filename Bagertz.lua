@@ -49,7 +49,7 @@
 BZ = {}
 BZ.ADDON_NAME = "Bagertz"
 BZ.PREFIX     = "BAGERTZ"
-BZ.VERSION    = "1.0.1"
+BZ.VERSION    = "1.1.0"
 
 BZ.data   = {} -- [charName] = { realm, time, bags = { [itemID] = count } }
 BZ.config = {} -- { password = string, debug = bool }
@@ -62,6 +62,7 @@ BZ.SEND_INTERVAL     = 0.4  -- seconds between outbound messages
 BZ.BEACON_INTERVAL   = 20   -- seconds between beacons while grouped
 BZ.SCAN_DEBOUNCE     = 2    -- seconds of quiet after a bag change before rescanning
 BZ.PEER_STALE_AFTER  = 60   -- seconds before a peer is considered gone
+BZ.MIN_RESEND_INTERVAL = 5  -- seconds between automatic resends after a bag change
 
 BZ.sendQueue    = {}
 BZ.sendTimer    = 0
@@ -124,8 +125,8 @@ end
 -- and modulus are kept tiny so the arithmetic stays exact in Lua 5.0's doubles.
 --
 -- Again: this is obfuscation. It stops casual reading, nothing more.
-BZ.ALPHABET = "0123456789:,"
-BZ.ALPHABET_LEN = 12
+BZ.ALPHABET = "0123456789:,;"
+BZ.ALPHABET_LEN = 13
 
 -- Deliberately contains every character class the wire format relies on, so
 -- /bz selftest proves whether the channel delivers them unaltered. The pipe is
@@ -168,12 +169,9 @@ function BZ.ItemIDFromLink(link)
     return tonumber(id)
 end
 
--- Bags 0-4 only for now: the bank (-1 and 5-10) is readable ONLY while the bank
--- frame is open, which needs its own "last seen at the bank" handling rather
--- than being folded in here.
-function BZ.ScanBags()
+local function ScanContainers(containers)
     local counts = {}
-    for bag = 0, 4 do
+    for _, bag in ipairs(containers) do
         local slots = GetContainerNumSlots(bag)
         if slots and slots > 0 then
             for slot = 1, slots do
@@ -188,14 +186,36 @@ function BZ.ScanBags()
     return counts
 end
 
+BZ.BAG_CONTAINERS  = { 0, 1, 2, 3, 4 }         -- backpack + equipped bags
+BZ.BANK_CONTAINERS = { -1, 5, 6, 7, 8, 9, 10 } -- bank window + purchased bank bags
+
+function BZ.ScanBags()
+    return ScanContainers(BZ.BAG_CONTAINERS)
+end
+
+function BZ.ScanBank()
+    return ScanContainers(BZ.BANK_CONTAINERS)
+end
+
+-- Bank contents are readable ONLY while the bank frame is open - away from a
+-- bank those containers report zero slots. So the bank is scanned while you are
+-- standing there and then KEPT, rather than rescanned on every bag update.
+-- Without that distinction, walking away from the bank would "helpfully" record
+-- an empty bank and wipe everything we knew about it.
 function BZ.UpdateOwnData()
     local me = BZ.Me()
     if not me then return end
-    BZ.data[me] = {
-        realm = GetRealmName(),
-        time  = time(),
-        bags  = BZ.ScanBags(),
-    }
+
+    local entry = BZ.data[me] or {}
+    entry.realm = GetRealmName()
+    entry.time  = time()
+    entry.bags  = BZ.ScanBags()
+    if BZ.atBank then
+        entry.bank = BZ.ScanBank()
+        entry.bankTime = time()
+    end
+
+    BZ.data[me] = entry
     Bagertz_Data = BZ.data
     BZ.inventoryDirty = true
     BZ.Debug("rescanned own bags")
@@ -209,7 +229,7 @@ end
 -- can rotate within it without changing the length.
 function BZ.Serialize(counts)
     local parts = {}
-    for id, count in pairs(counts) do
+    for id, count in pairs(counts or {}) do
         table.insert(parts, id .. ":" .. count)
     end
     return table.concat(parts, ",")
@@ -217,34 +237,79 @@ end
 
 function BZ.Deserialize(str)
     local counts = {}
-    for pair in string.gfind(str, "[^,]+") do
+    for pair in string.gfind(str or "", "[^,]+") do
         local _, _, id, count = string.find(pair, "(%d+):(%d+)")
         if id then counts[tonumber(id)] = tonumber(count) end
     end
     return counts
 end
 
-function BZ.Channel()
-    if GetNumRaidMembers() > 0 then return "RAID" end
-    if GetNumPartyMembers() > 0 then return "PARTY" end
-    return nil
+-- Bags and bank as two ";"-separated sections. The separator is part of
+-- BZ.ALPHABET so it gets rotated along with everything else rather than
+-- standing out as plaintext structure in an otherwise obfuscated payload.
+function BZ.SerializeEntry(entry)
+    return BZ.Serialize(entry.bags) .. ";" .. BZ.Serialize(entry.bank)
 end
 
-function BZ.Queue(msg)
-    table.insert(BZ.sendQueue, msg)
+function BZ.DeserializeEntry(str)
+    local _, _, bags, bank = string.find(str or "", "^([^;]*);(.*)$")
+    if not bags then
+        -- No separator: a sender from before the bank existed. Treat the whole
+        -- thing as bags rather than discarding it.
+        return BZ.Deserialize(str), nil
+    end
+    return BZ.Deserialize(bags), BZ.Deserialize(bank)
+end
+
+-- Every channel we could currently reach a paired box on, narrowest first.
+-- GUILD is included so the two boxes can find each other without being grouped,
+-- but it is deliberately LAST: a party is two people, a guild can be hundreds,
+-- and the inventory should go out over the smallest audience that reaches the
+-- other box (see BZ.ChannelsForPeers).
+function BZ.Channels()
+    local channels = {}
+    if GetNumRaidMembers() > 0 then
+        table.insert(channels, "RAID")
+    elseif GetNumPartyMembers() > 0 then
+        table.insert(channels, "PARTY")
+    end
+    if BZ.config.useGuild ~= false and IsInGuild and IsInGuild() then
+        table.insert(channels, "GUILD")
+    end
+    return channels
+end
+
+function BZ.Channel()
+    local channels = BZ.Channels()
+    return channels[1]
+end
+
+-- The channels a currently-known paired box was actually heard on. The bulky
+-- inventory goes only to these, so being in a big guild doesn't mean every
+-- sync sprays the whole guild - once your other box has been heard in the
+-- party, that's where the data goes.
+function BZ.ChannelsForPeers()
+    local seen, channels = {}, {}
+    for _, peer in pairs(BZ.peers) do
+        local c = peer.channel
+        if c and not seen[c] then
+            seen[c] = true
+            table.insert(channels, c)
+        end
+    end
+    return channels
+end
+
+function BZ.Queue(msg, channel)
+    table.insert(BZ.sendQueue, { msg = msg, channel = channel })
 end
 
 function BZ.DrainQueue()
-    local msg = table.remove(BZ.sendQueue, 1)
-    if not msg then return end
-    local channel = BZ.Channel()
-    if not channel then
-        BZ.sendQueue = {}
-        return
-    end
-    pcall(SendAddonMessage, BZ.PREFIX, msg, channel)
+    local item = table.remove(BZ.sendQueue, 1)
+    if not item then return end
+    pcall(SendAddonMessage, BZ.PREFIX, item.msg, item.channel)
     BZ.stats.sent = BZ.stats.sent + 1
-    BZ.Debug("sent [" .. channel .. "]: " .. string.sub(msg, 1, 60))
+    BZ.Debug("sent [" .. item.channel .. "]: " .. string.sub(item.msg, 1, 60))
 end
 
 -- A beacon says "I'm here and I know the password" in a few bytes. The full
@@ -254,17 +319,30 @@ function BZ.SendBeacon()
     local nonce = math.random(100000, 999999)
     local tag = BZ.Tag(nonce)
     if not tag then return end
-    if not BZ.Channel() then return end
-    BZ.Queue("B~" .. nonce .. "~" .. tag .. "~" .. BZ.Me())
+    -- Beacons go out on every reachable channel, since that's how the two boxes
+    -- find each other in the first place. They're a few bytes and say only
+    -- "someone here runs this addon".
+    local channels = BZ.Channels()
+    for _, channel in ipairs(channels) do
+        BZ.Queue("B~" .. nonce .. "~" .. tag .. "~" .. BZ.Me(), channel)
+    end
 end
 
 function BZ.SendInventory()
-    local tag0 = BZ.config.password
-    if not tag0 or tag0 == "" then
+    local password = BZ.config.password
+    if not password or password == "" then
         BZ.Debug("no password set - refusing to send")
         return
     end
-    if not BZ.Channel() then return end
+
+    -- Only to channels where a paired box has actually been heard. No peers
+    -- means nothing to say, which is what keeps a big guild from receiving
+    -- every sync.
+    local channels = BZ.ChannelsForPeers()
+    if table.getn(channels) == 0 then
+        BZ.Debug("no paired box heard yet - holding the inventory back")
+        return
+    end
 
     local me = BZ.Me()
     local own = BZ.data[me]
@@ -278,18 +356,24 @@ function BZ.SendInventory()
     local tag = BZ.Tag(nonce)
     if not tag then return end
 
-    local payload = BZ.Crypt(BZ.Serialize(own.bags), nonce, false)
+    local payload = BZ.Crypt(BZ.SerializeEntry(own), nonce, false)
 
     local total = math.ceil(string.len(payload) / BZ.MAX_PAYLOAD)
     if total < 1 then total = 1 end
 
-    BZ.Queue("H~" .. nonce .. "~" .. tag .. "~" .. me .. "~" .. total)
-    for i = 1, total do
-        local from = (i - 1) * BZ.MAX_PAYLOAD + 1
-        BZ.Queue("D~" .. nonce .. "~" .. i .. "~" .. string.sub(payload, from, from + BZ.MAX_PAYLOAD - 1))
+    for _, channel in ipairs(channels) do
+        BZ.Queue("H~" .. nonce .. "~" .. tag .. "~" .. me .. "~" ..
+            (BZ.config.account or "") .. "~" .. total, channel)
+        for i = 1, total do
+            local from = (i - 1) * BZ.MAX_PAYLOAD + 1
+            BZ.Queue("D~" .. nonce .. "~" .. i .. "~" ..
+                string.sub(payload, from, from + BZ.MAX_PAYLOAD - 1), channel)
+        end
     end
     BZ.inventoryDirty = false
-    BZ.Debug("queued inventory: " .. total .. " chunk(s), " .. string.len(payload) .. " chars")
+    BZ.lastInventorySend = time()
+    BZ.Debug("queued inventory: " .. total .. " chunk(s), " .. string.len(payload) .. " chars, to " ..
+        table.concat(channels, "+"))
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -335,7 +419,9 @@ function BZ.OnAddonMessage(msg, sender)
             return
         end
         local firstSeen = not BZ.peers[name]
-        BZ.peers[name] = time()
+        -- Remember WHERE we heard them, so the inventory goes back over the same
+        -- channel rather than every channel we happen to be on.
+        BZ.peers[name] = { time = time(), channel = channel or BZ.Channel() }
         BZ.Debug("paired beacon from " .. name)
         -- Someone we trust is here: send ours, but only if it's changed since
         -- last time or we've never met them.
@@ -344,14 +430,18 @@ function BZ.OnAddonMessage(msg, sender)
         end
 
     elseif kind == "H" then
-        local _, _, nonce, tag, name, total = string.find(rest, "^(%d+)~(%d+)~(.+)~(%d+)$")
+        local _, _, nonce, tag, name, account, total =
+            string.find(rest, "^(%d+)~(%d+)~([^~]+)~([^~]*)~(%d+)$")
         if not nonce then return end
         if tag ~= BZ.Tag(nonce) then
             BZ.stats.rejected = BZ.stats.rejected + 1
             BZ.Debug("header from " .. tostring(name) .. " failed the password check - ignored")
             return
         end
-        BZ.incoming[sender] = { nonce = nonce, name = name, expected = tonumber(total), chunks = {} }
+        BZ.incoming[sender] = {
+            nonce = nonce, name = name, account = account,
+            expected = tonumber(total), chunks = {},
+        }
         BZ.Debug("incoming inventory from " .. name .. " (" .. total .. " chunks)")
 
     elseif kind == "D" then
@@ -372,19 +462,30 @@ function BZ.OnAddonMessage(msg, sender)
         for i = 1, pending.expected do
             joined = joined .. (pending.chunks[i] or "")
         end
-        local counts = BZ.Deserialize(BZ.Crypt(joined, pending.nonce, true))
+        local bags, bank = BZ.DeserializeEntry(BZ.Crypt(joined, pending.nonce, true))
 
-        local n = 0
-        for _ in pairs(counts) do n = n + 1 end
+        local nBags, nBank = 0, 0
+        for _ in pairs(bags or {}) do nBags = nBags + 1 end
+        for _ in pairs(bank or {}) do nBank = nBank + 1 end
 
-        BZ.data[pending.name] = {
-            realm = GetRealmName(),
-            time  = time(),
-            bags  = counts,
-        }
+        local entry = BZ.data[pending.name] or {}
+        entry.realm   = GetRealmName()
+        entry.time    = time()
+        entry.account = (pending.account ~= "" and pending.account) or entry.account
+        entry.bags    = bags
+        -- Only replace a known bank with a non-empty one: the sender may not have
+        -- visited a bank yet this session, and an empty section from them
+        -- shouldn't erase what we already had.
+        if bank and nBank > 0 then
+            entry.bank = bank
+            entry.bankTime = time()
+        end
+
+        BZ.data[pending.name] = entry
         Bagertz_Data = BZ.data
         BZ.incoming[sender] = nil
-        BZ.Say("updated " .. pending.name .. "'s bags (" .. n .. " item types).")
+        BZ.Say("updated " .. BZ.DisplayName(pending.name) .. " - " .. nBags ..
+            " item types in bags" .. (nBank > 0 and (", " .. nBank .. " in bank") or "") .. ".")
     end
 end
 
@@ -393,8 +494,23 @@ end
 -- ---------------------------------------------------------------------------------------------
 function BZ.CountFor(name, itemID)
     local entry = BZ.data[name]
-    if not entry or not entry.bags then return 0 end
-    return entry.bags[itemID] or 0
+    if not entry then return 0, 0 end
+    local bags = (entry.bags and entry.bags[itemID]) or 0
+    local bank = (entry.bank and entry.bank[itemID]) or 0
+    return bags, bank
+end
+
+-- "Account/Character" where the account is known. WoW's API exposes no account
+-- name at all - it exists only as a folder name on disk - so it's a label the
+-- player sets once per account (/bz account) which then travels with that
+-- account's data. Without one, the character name stands alone rather than
+-- showing a confusing empty prefix.
+function BZ.DisplayName(name)
+    local entry = BZ.data[name]
+    local account = entry and entry.account
+    if name == BZ.Me() then account = BZ.config.account or account end
+    if account and account ~= "" then return account .. "/" .. name end
+    return name
 end
 
 function BZ.AddTooltipLines(tooltip, itemID)
@@ -406,12 +522,28 @@ function BZ.AddTooltipLines(tooltip, itemID)
         if name ~= me then table.insert(names, name) end
     end
     table.sort(names)
+    -- Your own character first: it's the count you're most often checking
+    -- against, and it reads oddly below a list of alts.
+    if BZ.data[me] then table.insert(names, 1, me) end
 
     local any = false
     for _, name in ipairs(names) do
-        local count = BZ.CountFor(name, itemID)
-        if count > 0 then
-            tooltip:AddLine(name .. ": " .. count .. " in bags", 1, 0.82, 0)
+        local bags, bank = BZ.CountFor(name, itemID)
+        if bags > 0 or bank > 0 then
+            local parts = {}
+            if bags > 0 then table.insert(parts, bags .. " in bags") end
+            if bank > 0 then table.insert(parts, bank .. " in bank") end
+
+            local text = BZ.DisplayName(name) .. ": " .. table.concat(parts, ", ")
+            if bags > 0 and bank > 0 then
+                text = text .. " (" .. (bags + bank) .. ")"
+            end
+
+            if name == me then
+                tooltip:AddLine(text, 0.4, 1, 0.4)
+            else
+                tooltip:AddLine(text, 1, 0.82, 0)
+            end
             any = true
         end
     end
@@ -530,6 +662,37 @@ SlashCmdList["BAGERTZ"] = function(msg)
         Bagertz_Config = BZ.config
         BZ.Say("debug: " .. (BZ.config.debug and "|cFF00FF7Fon|r" or "|cFFFF5179off|r"))
 
+    elseif cmd == "account" then
+        if not words[2] then
+            BZ.Say("this account is labelled: " ..
+                ((BZ.config.account and BZ.config.account ~= "")
+                    and ("|cFF00FF7F" .. BZ.config.account .. "|r")
+                    or "|cFFFF5179unlabelled|r - use |cFFFFFFFF/bz account <name>|r"))
+            BZ.Say("WoW gives addons no way to read your account name, so this is a label " ..
+                "you choose. Set a different one on each box.")
+        else
+            -- Tildes would break the wire format, which uses them as the field
+            -- separator.
+            local label = string.gsub(words[2], "~", "-")
+            BZ.config.account = label
+            Bagertz_Config = BZ.config
+            BZ.inventoryDirty = true
+            BZ.Say("this account is now labelled |cFF00FF7F" .. label .. "|r.")
+        end
+
+    elseif cmd == "guild" then
+        if string.lower(words[2] or "") == "off" then
+            BZ.config.useGuild = false
+            Bagertz_Config = BZ.config
+            BZ.Say("guild channel off - the boxes will only find each other while grouped.")
+        else
+            BZ.config.useGuild = true
+            Bagertz_Config = BZ.config
+            BZ.Say("guild channel on - the boxes can find each other without being grouped, " ..
+                "as long as both are in a guild. Inventory still only goes to a box that " ..
+                "answered with the right password.")
+        end
+
     elseif cmd == "selftest" then
         if not BZ.Channel() then
             BZ.Say("you're not in a party or raid - nothing to send a test through.")
@@ -549,8 +712,12 @@ SlashCmdList["BAGERTZ"] = function(msg)
         local channel = BZ.Channel()
         BZ.Say("password: " .. ((BZ.config.password and BZ.config.password ~= "")
             and "|cFF00FF7Fset|r" or "|cFFFF5179NOT SET|r - nothing will be shared"))
-        BZ.Say("group: " .. (channel and ("|cFF00FF7F" .. channel .. "|r") or
-            "|cFFFF5179solo|r - nothing will be sent until you're grouped"))
+        local reachable = BZ.Channels()
+        BZ.Say("channels: " .. (table.getn(reachable) > 0
+            and ("|cFF00FF7F" .. table.concat(reachable, ", ") .. "|r")
+            or "|cFFFF5179none|r - not grouped and not in a guild, so nothing can be sent"))
+        BZ.Say("account label: " .. ((BZ.config.account and BZ.config.account ~= "")
+            and ("|cFF00FF7F" .. BZ.config.account .. "|r") or "|cFFFF5179unset|r (/bz account <name>)"))
 
         local peerNames = {}
         for name in pairs(BZ.peers) do table.insert(peerNames, name) end
@@ -588,8 +755,8 @@ SlashCmdList["BAGERTZ"] = function(msg)
         end
 
     else
-        BZ.Say("usage: /bz, /bz password <word>, /bz password off, /bz sync, /bz selftest, " ..
-            "/bz forget <name>, /bz clear, /bz debug")
+        BZ.Say("usage: /bz, /bz account <name>, /bz password <word>, /bz password off,")
+        BZ.Say("       /bz guild on|off, /bz sync, /bz selftest, /bz forget <name>, /bz clear, /bz debug")
     end
 end
 
@@ -600,6 +767,9 @@ local ev = CreateFrame("Frame")
 ev:RegisterEvent("ADDON_LOADED")
 ev:RegisterEvent("PLAYER_ENTERING_WORLD")
 ev:RegisterEvent("BAG_UPDATE")
+ev:RegisterEvent("BANKFRAME_OPENED")
+ev:RegisterEvent("BANKFRAME_CLOSED")
+ev:RegisterEvent("PLAYERBANKSLOTS_CHANGED")
 ev:RegisterEvent("PARTY_MEMBERS_CHANGED")
 ev:RegisterEvent("RAID_ROSTER_UPDATE")
 ev:RegisterEvent("CHAT_MSG_ADDON")
@@ -621,10 +791,21 @@ ev:SetScript("OnEvent", function()
             BZ.OnAddonMessage(arg2, arg4)
         end
 
-    elseif event == "BAG_UPDATE" then
+    elseif event == "BAG_UPDATE" or event == "PLAYERBANKSLOTS_CHANGED" then
         -- Debounced: looting a stack fires this several times in a row, and
         -- rescanning every bag on each one is wasted work.
         BZ.scanTimer = BZ.SCAN_DEBOUNCE
+
+    elseif event == "BANKFRAME_OPENED" then
+        BZ.atBank = true
+        BZ.UpdateOwnData()
+
+    elseif event == "BANKFRAME_CLOSED" then
+        -- One last scan WHILE the frame is still readable, then stop. After this
+        -- the bank containers report no slots, so anything scanned later would
+        -- read as an empty bank.
+        BZ.UpdateOwnData()
+        BZ.atBank = false
 
     elseif event == "PLAYER_ENTERING_WORLD" then
         BZ.UpdateOwnData()
@@ -642,6 +823,14 @@ ev:SetScript("OnUpdate", function()
         if BZ.scanTimer <= 0 then
             BZ.scanTimer = nil
             BZ.UpdateOwnData()
+            -- Push the change straight out rather than waiting for the other
+            -- box's next beacon, which could be 20s away. Rate-limited so
+            -- rearranging your bags doesn't turn into a broadcast per move.
+            if BZ.inventoryDirty and table.getn(BZ.ChannelsForPeers()) > 0 then
+                if not BZ.lastInventorySend or (time() - BZ.lastInventorySend) >= BZ.MIN_RESEND_INTERVAL then
+                    BZ.SendInventory()
+                end
+            end
         end
     end
 
@@ -658,7 +847,7 @@ ev:SetScript("OnUpdate", function()
         -- Drop peers we haven't heard from in a while so a departed box stops
         -- counting as present.
         for name, seen in pairs(BZ.peers) do
-            if (time() - seen) > BZ.PEER_STALE_AFTER then BZ.peers[name] = nil end
+            if (time() - (seen.time or 0)) > BZ.PEER_STALE_AFTER then BZ.peers[name] = nil end
         end
     end
 end)

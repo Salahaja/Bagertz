@@ -31,13 +31,14 @@ end
 
 -- One simulated client: its own BZ table, its own saved variables, its own bags.
 local activate
-local function newClient(charName, bags)
+local function newClient(charName, bags, bank)
     Stub.Reset()
     Stub.SetRoster({ player = charName, party = { "Someone" } })
 
     GetRealmName = function() return "N'Zoth" end
     GetNumPartyMembers = function() return 1 end
     GetNumRaidMembers = function() return 0 end
+    IsInGuild = function() return nil end
     time = os.time
     GameTooltip = Stub.CreateFrame("Frame", "GameTooltip")
     ItemRefTooltip = Stub.CreateFrame("Frame", "ItemRefTooltip")
@@ -46,7 +47,7 @@ local function newClient(charName, bags)
 
     BZ = nil
     dofile(ADDON_PATH)
-    local client = { BZ = BZ, sent = {}, name = charName, bags = bags }
+    local client = { BZ = BZ, sent = {}, name = charName, bags = bags, bank = bank }
     BZ.data, BZ.config = {}, {}
     activate(client)
     return client
@@ -63,17 +64,25 @@ function activate(client)
         table.insert(client.sent, { prefix = prefix, msg = msg, channel = channel })
     end
     -- bags = { [bagIndex] = { {id=, count=}, ... } }
+    -- Bank containers only report slots while the bank frame is open, exactly
+    -- like the real client - so a test that forgets to open it sees no bank.
+    local function container(bag)
+        if bag <= -1 or bag >= 5 then
+            return (client.BZ and client.BZ.atBank) and client.bank and client.bank[bag] or nil
+        end
+        return client.bags[bag]
+    end
     GetContainerNumSlots = function(bag)
-        local b = client.bags[bag]
+        local b = container(bag)
         return b and table.getn(b) or 0
     end
     GetContainerItemLink = function(bag, slot)
-        local b = client.bags[bag]
+        local b = container(bag)
         local item = b and b[slot]
         return item and ("|cffffffff|Hitem:" .. item.id .. ":0:0:0|h[Thing]|h|r") or nil
     end
     GetContainerItemInfo = function(bag, slot)
-        local b = client.bags[bag]
+        local b = container(bag)
         local item = b and b[slot]
         if not item then return nil end
         return "texture", item.count, nil, 1, nil
@@ -125,6 +134,9 @@ do
     activate(a)
     a.BZ.config.password = "hunter2"
     a.BZ.UpdateOwnData()
+    -- A peer has to have been heard before the inventory will go out at all,
+    -- so seed one; otherwise only the beacon is sent.
+    a.BZ.peers["Bob"] = { time = os.time(), channel = "PARTY" }
     a.BZ.SendBeacon()
     a.BZ.SendInventory()
     while table.getn(a.BZ.sendQueue) > 0 do a.BZ.DrainQueue() end
@@ -135,6 +147,24 @@ do
     end
     check("no message contains the password", leaked, false)
     check("something was actually sent", table.getn(a.sent) > 1, true)
+end
+
+-- ---------------------------------------------------------------------------
+print("the inventory is held back until a paired box has been heard")
+do
+    local a = newClient("Alice", ALICE_BAGS)
+    activate(a)
+    a.BZ.config.password = "shared"
+    a.BZ.UpdateOwnData()
+    a.BZ.SendInventory()
+    while table.getn(a.BZ.sendQueue) > 0 do a.BZ.DrainQueue() end
+    check("nothing sent with no peer known", table.getn(a.sent), 0)
+
+    a.BZ.peers["Bob"] = { time = os.time(), channel = "PARTY" }
+    a.BZ.SendInventory()
+    while table.getn(a.BZ.sendQueue) > 0 do a.BZ.DrainQueue() end
+    check("sent once a peer is known", table.getn(a.sent) > 0, true)
+    check("  and only to that peer's channel", a.sent[1].channel, "PARTY")
 end
 
 -- ---------------------------------------------------------------------------
@@ -222,7 +252,9 @@ do
     activate(a); a.BZ.config.password = "shared"; a.BZ.UpdateOwnData()
     activate(b); b.BZ.config.password = "shared"; b.BZ.UpdateOwnData()
 
-    activate(a); a.BZ.SendInventory()
+    activate(a)
+    a.BZ.peers["Bob"] = { time = os.time(), channel = "PARTY" }
+    a.BZ.SendInventory()
     local count = deliver(a, b)
     check("it took more than one message", count > 2, true)
 
@@ -260,7 +292,7 @@ do
 end
 
 -- ---------------------------------------------------------------------------
-print("tooltip lines report other characters only")
+print("tooltip lists you first, then other characters")
 do
     local a = newClient("Alice", ALICE_BAGS)
     activate(a)
@@ -274,12 +306,123 @@ do
     tip.Show = function() end
 
     a.BZ.AddTooltipLines(tip, 2589)
-    check("one line for the other character", table.getn(lines), 1)
-    check("  naming Bob and his count", lines[1], "Bob: 40 in bags")
+    check("a line each for you and the other character", table.getn(lines), 2)
+    check("  your own count comes first", lines[1], "Alice: 32 in bags")
+    check("  then the other character", lines[2], "Bob: 40 in bags")
 
     lines = {}
     a.BZ.AddTooltipLines(tip, 999999)
     check("nothing for an item nobody has", table.getn(lines), 0)
+end
+
+-- ---------------------------------------------------------------------------
+print("tooltip shows bank alongside bags, with a total")
+do
+    local a = newClient("Alice", ALICE_BAGS)
+    activate(a)
+    a.BZ.data["Bob"] = {
+        realm = "N'Zoth", time = os.time(),
+        bags = { [2589] = 4 }, bank = { [2589] = 60 },
+    }
+
+    local lines = {}
+    local tip = Stub.CreateFrame("Frame")
+    tip.AddLine = function(self, text) table.insert(lines, text) end
+    tip.Show = function() end
+
+    -- This client never scanned its own bags, so Bob is the only line.
+    a.BZ.AddTooltipLines(tip, 2589)
+    check("both locations and a total", lines[1], "Bob: 4 in bags, 60 in bank (64)")
+
+    -- Bank-only should not claim "0 in bags".
+    lines = {}
+    a.BZ.data["Bob"] = { realm = "N'Zoth", time = os.time(), bags = {}, bank = { [777] = 5 } }
+    a.BZ.AddTooltipLines(tip, 777)
+    check("bank only", lines[1], "Bob: 5 in bank")
+end
+
+-- ---------------------------------------------------------------------------
+print("the account label prefixes the character name")
+do
+    local a = newClient("Alice", ALICE_BAGS)
+    activate(a)
+    a.BZ.config.account = "MAIN"
+    a.BZ.UpdateOwnData()
+    a.BZ.data["Bob"] = {
+        realm = "N'Zoth", time = os.time(), account = "ALT", bags = { [2589] = 40 },
+    }
+
+    local lines = {}
+    local tip = Stub.CreateFrame("Frame")
+    tip.AddLine = function(self, text) table.insert(lines, text) end
+    tip.Show = function() end
+
+    a.BZ.AddTooltipLines(tip, 2589)
+    check("your own account label", lines[1], "MAIN/Alice: 32 in bags")
+    check("the other box's label", lines[2], "ALT/Bob: 40 in bags")
+
+    -- An unlabelled character shouldn't show a dangling slash.
+    a.BZ.data["Bob"].account = nil
+    lines = {}
+    a.BZ.AddTooltipLines(tip, 2589)
+    check("no label means no prefix", lines[2], "Bob: 40 in bags")
+end
+
+-- ---------------------------------------------------------------------------
+print("bank is scanned at the bank, kept after leaving, and synced")
+do
+    local BANK = { [-1] = { { id = 2589, count = 100 } }, [5] = { { id = 4306, count = 20 } } }
+    local a = newClient("Alice", ALICE_BAGS, BANK)
+    local b = newClient("Bob", { [0] = {} })
+    activate(a); a.BZ.config.password = "shared"; a.BZ.config.account = "MAIN"
+    activate(b); b.BZ.config.password = "shared"
+
+    -- Away from a bank: nothing recorded.
+    activate(a)
+    a.BZ.UpdateOwnData()
+    check("no bank recorded away from a bank", a.BZ.data["Alice"].bank, nil)
+
+    -- At the bank.
+    a.BZ.atBank = true
+    a.BZ.UpdateOwnData()
+    check("bank scanned at the bank", a.BZ.data["Alice"].bank[2589], 100)
+    check("  including bank bags", a.BZ.data["Alice"].bank[4306], 20)
+
+    -- Walking away must NOT wipe it, even though the containers go unreadable.
+    a.BZ.atBank = false
+    a.BZ.UpdateOwnData()
+    check("bank kept after leaving", a.BZ.data["Alice"].bank[2589], 100)
+
+    -- And it reaches the other box.
+    a.BZ.peers["Bob"] = { time = os.time(), channel = "PARTY" }
+    a.BZ.SendInventory()
+    deliver(a, b)
+    activate(b)
+    check("Bob received Alice's bank", b.BZ.data["Alice"].bank[2589], 100)
+    check("  and her bags", b.BZ.data["Alice"].bags[2589], 32)
+    check("  and her account label", b.BZ.data["Alice"].account, "MAIN")
+end
+
+-- ---------------------------------------------------------------------------
+print("guild is used as a channel when guilded")
+do
+    local a = newClient("Alice", ALICE_BAGS)
+    activate(a)
+    a.BZ.config.password = "shared"
+
+    IsInGuild = function() return nil end
+    GetNumPartyMembers = function() return 0 end
+    check("solo and unguilded: no channels", table.getn(a.BZ.Channels()), 0)
+
+    IsInGuild = function() return 1 end
+    local channels = a.BZ.Channels()
+    check("guilded but ungrouped: guild only", table.concat(channels, ","), "GUILD")
+
+    GetNumPartyMembers = function() return 1 end
+    check("grouped and guilded: party first", a.BZ.Channels()[1], "PARTY")
+
+    a.BZ.config.useGuild = false
+    check("guild can be turned off", table.concat(a.BZ.Channels(), ","), "PARTY")
 end
 
 -- ---------------------------------------------------------------------------
