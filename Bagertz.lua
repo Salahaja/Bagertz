@@ -49,7 +49,7 @@
 BZ = {}
 BZ.ADDON_NAME = "Bagertz"
 BZ.PREFIX     = "BAGERTZ"
-BZ.VERSION    = "1.0.0"
+BZ.VERSION    = "1.0.1"
 
 BZ.data   = {} -- [charName] = { realm, time, bags = { [itemID] = count } }
 BZ.config = {} -- { password = string, debug = bool }
@@ -70,6 +70,12 @@ BZ.scanTimer    = nil  -- nil = no rescan pending
 BZ.peers        = {}   -- [charName] = last time a valid beacon was heard
 BZ.incoming     = {}   -- [charName] = { nonce, chunks, expected, name }
 BZ.inventoryDirty = true
+
+-- Session counters, so "it isn't working" can be narrowed down without guessing:
+-- nothing sent means we're solo or have no password; sent but nothing received
+-- means the other box isn't hearing us at all; received-but-rejected means the
+-- passwords differ.
+BZ.stats = { sent = 0, received = 0, rejected = 0 }
 
 -- ---------------------------------------------------------------------------------------------
 -- Helpers
@@ -120,6 +126,12 @@ end
 -- Again: this is obfuscation. It stops casual reading, nothing more.
 BZ.ALPHABET = "0123456789:,"
 BZ.ALPHABET_LEN = 12
+
+-- Deliberately contains every character class the wire format relies on, so
+-- /bz selftest proves whether the channel delivers them unaltered. The pipe is
+-- in here on purpose: it is WoW's escape character for |c / |r / |H, which is
+-- exactly why the delimiter is a tilde and not a pipe.
+BZ.CANARY = "1234567890:,~and|pipe"
 
 function BZ.Crypt(text, nonce, decrypt)
     if not BZ.config.password or BZ.config.password == "" then return text end
@@ -231,7 +243,8 @@ function BZ.DrainQueue()
         return
     end
     pcall(SendAddonMessage, BZ.PREFIX, msg, channel)
-    BZ.Debug("sent: " .. string.sub(msg, 1, 40) .. "...")
+    BZ.stats.sent = BZ.stats.sent + 1
+    BZ.Debug("sent [" .. channel .. "]: " .. string.sub(msg, 1, 60))
 end
 
 -- A beacon says "I'm here and I know the password" in a few bytes. The full
@@ -242,7 +255,7 @@ function BZ.SendBeacon()
     local tag = BZ.Tag(nonce)
     if not tag then return end
     if not BZ.Channel() then return end
-    BZ.Queue("B|" .. nonce .. "|" .. tag .. "|" .. BZ.Me())
+    BZ.Queue("B~" .. nonce .. "~" .. tag .. "~" .. BZ.Me())
 end
 
 function BZ.SendInventory()
@@ -270,10 +283,10 @@ function BZ.SendInventory()
     local total = math.ceil(string.len(payload) / BZ.MAX_PAYLOAD)
     if total < 1 then total = 1 end
 
-    BZ.Queue("H|" .. nonce .. "|" .. tag .. "|" .. me .. "|" .. total)
+    BZ.Queue("H~" .. nonce .. "~" .. tag .. "~" .. me .. "~" .. total)
     for i = 1, total do
         local from = (i - 1) * BZ.MAX_PAYLOAD + 1
-        BZ.Queue("D|" .. nonce .. "|" .. i .. "|" .. string.sub(payload, from, from + BZ.MAX_PAYLOAD - 1))
+        BZ.Queue("D~" .. nonce .. "~" .. i .. "~" .. string.sub(payload, from, from + BZ.MAX_PAYLOAD - 1))
     end
     BZ.inventoryDirty = false
     BZ.Debug("queued inventory: " .. total .. " chunk(s), " .. string.len(payload) .. " chars")
@@ -284,15 +297,40 @@ end
 -- ---------------------------------------------------------------------------------------------
 function BZ.OnAddonMessage(msg, sender)
     if sender == BZ.Me() then return end
+    BZ.stats.received = BZ.stats.received + 1
+    BZ.Debug("recv from " .. tostring(sender) .. ": " .. string.sub(msg, 1, 60))
+
+    local _, _, kind, rest = string.find(msg, "^(%a)~(.+)$")
+    if not kind then
+        -- Arrived but unparseable. Worth surfacing rather than dropping: it's
+        -- what a transport that mangles the delimiter looks like from here.
+        BZ.stats.rejected = BZ.stats.rejected + 1
+        BZ.Debug("  could not parse that message - delimiter may have been altered in transit")
+        return
+    end
+
+    -- Canary: echoes exactly what arrived so a mangled transport is visible.
+    -- Debug-gated so a stranger can't print into your chat frame at will.
+    if kind == "T" then
+        if BZ.config.debug then
+            BZ.Say("selftest from " .. tostring(sender) .. " arrived as: |cFFFFFFFF" .. rest .. "|r")
+            BZ.Say("  it was sent as: |cFFFFFFFF" .. BZ.CANARY .. "|r")
+            if rest == BZ.CANARY then
+                BZ.Say("  |cFF00FF7Fidentical - the channel passes our characters through intact.|r")
+            else
+                BZ.Say("  |cFFFF5179ALTERED IN TRANSIT|r - that's the bug.")
+            end
+        end
+        return
+    end
+
     if not BZ.config.password or BZ.config.password == "" then return end
 
-    local _, _, kind, rest = string.find(msg, "^(%a)|(.+)$")
-    if not kind then return end
-
     if kind == "B" then
-        local _, _, nonce, tag, name = string.find(rest, "^(%d+)|(%d+)|(.+)$")
+        local _, _, nonce, tag, name = string.find(rest, "^(%d+)~(%d+)~(.+)$")
         if not nonce then return end
         if tag ~= BZ.Tag(nonce) then
+            BZ.stats.rejected = BZ.stats.rejected + 1
             BZ.Debug("beacon from " .. tostring(name) .. " failed the password check - ignored")
             return
         end
@@ -306,9 +344,10 @@ function BZ.OnAddonMessage(msg, sender)
         end
 
     elseif kind == "H" then
-        local _, _, nonce, tag, name, total = string.find(rest, "^(%d+)|(%d+)|(.+)|(%d+)$")
+        local _, _, nonce, tag, name, total = string.find(rest, "^(%d+)~(%d+)~(.+)~(%d+)$")
         if not nonce then return end
         if tag ~= BZ.Tag(nonce) then
+            BZ.stats.rejected = BZ.stats.rejected + 1
             BZ.Debug("header from " .. tostring(name) .. " failed the password check - ignored")
             return
         end
@@ -316,7 +355,7 @@ function BZ.OnAddonMessage(msg, sender)
         BZ.Debug("incoming inventory from " .. name .. " (" .. total .. " chunks)")
 
     elseif kind == "D" then
-        local _, _, nonce, index, data = string.find(rest, "^(%d+)|(%d+)|(.*)$")
+        local _, _, nonce, index, data = string.find(rest, "^(%d+)~(%d+)~(.*)$")
         if not nonce then return end
         local pending = BZ.incoming[sender]
         -- The nonce ties chunks to the header that was already password-checked,
@@ -491,8 +530,46 @@ SlashCmdList["BAGERTZ"] = function(msg)
         Bagertz_Config = BZ.config
         BZ.Say("debug: " .. (BZ.config.debug and "|cFF00FF7Fon|r" or "|cFFFF5179off|r"))
 
+    elseif cmd == "selftest" then
+        if not BZ.Channel() then
+            BZ.Say("you're not in a party or raid - nothing to send a test through.")
+        elseif not BZ.config.debug then
+            BZ.Say("turn on |cFFFFFFFF/bz debug|r on BOTH boxes first, then run this again " ..
+                "(the echo only prints in debug, so strangers can't spam your chat).")
+        else
+            BZ.Queue("T~" .. BZ.CANARY)
+            BZ.Say("canary sent. The other box will print what actually arrived.")
+        end
+
     elseif cmd == "" then
         local me = BZ.Me()
+
+        -- Status first: this is the part that turns "it isn't working" into a
+        -- specific answer.
+        local channel = BZ.Channel()
+        BZ.Say("password: " .. ((BZ.config.password and BZ.config.password ~= "")
+            and "|cFF00FF7Fset|r" or "|cFFFF5179NOT SET|r - nothing will be shared"))
+        BZ.Say("group: " .. (channel and ("|cFF00FF7F" .. channel .. "|r") or
+            "|cFFFF5179solo|r - nothing will be sent until you're grouped"))
+
+        local peerNames = {}
+        for name in pairs(BZ.peers) do table.insert(peerNames, name) end
+        if table.getn(peerNames) > 0 then
+            BZ.Say("paired boxes heard: |cFF00FF7F" .. table.concat(peerNames, ", ") .. "|r")
+        else
+            BZ.Say("paired boxes heard: |cFFFF5179none|r")
+        end
+
+        BZ.Say("this session - sent " .. BZ.stats.sent .. ", received " .. BZ.stats.received ..
+            ", rejected " .. BZ.stats.rejected)
+        if BZ.stats.sent > 0 and BZ.stats.received == 0 then
+            BZ.Say("  |cFFFF5179sending but hearing nothing|r - the other box isn't receiving, " ..
+                "or isn't running this addon.")
+        elseif BZ.stats.rejected > 0 and BZ.stats.rejected == BZ.stats.received then
+            BZ.Say("  |cFFFF5179everything received was rejected|r - the passwords differ, " ..
+                "or the message was altered in transit (try |cFFFFFFFF/bz selftest|r).")
+        end
+
         local names = {}
         for name in pairs(BZ.data) do table.insert(names, name) end
         table.sort(names)
@@ -511,7 +588,7 @@ SlashCmdList["BAGERTZ"] = function(msg)
         end
 
     else
-        BZ.Say("usage: /bz, /bz password <word>, /bz password off, /bz sync, " ..
+        BZ.Say("usage: /bz, /bz password <word>, /bz password off, /bz sync, /bz selftest, " ..
             "/bz forget <name>, /bz clear, /bz debug")
     end
 end
