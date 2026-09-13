@@ -49,7 +49,7 @@
 BZ = {}
 BZ.ADDON_NAME = "Bagertz"
 BZ.PREFIX     = "BAGERTZ"
-BZ.VERSION    = "1.1.0"
+BZ.VERSION    = "1.2.0"
 
 BZ.data   = {} -- [charName] = { realm, time, bags = { [itemID] = count } }
 BZ.config = {} -- { password = string, debug = bool }
@@ -118,15 +118,24 @@ function BZ.Tag(nonce)
     return string.format("%d", BZ.Hash(BZ.config.password .. ":" .. nonce))
 end
 
--- Payload characters are only ever digits, ':' and ',' (see BZ.Serialize), so a
--- rotation within that same 12-symbol alphabet keeps the message printable and
+-- Rotation happens within this alphabet, which keeps the message printable and
 -- exactly the same length - no base64/hex expansion eating into the 255-byte
 -- budget. The keystream is a small LCG seeded from password+nonce; multiplier
 -- and modulus are kept tiny so the arithmetic stays exact in Lua 5.0's doubles.
 --
+-- Letters are in here because the payload now carries CHARACTER NAMES (a sync
+-- sends every character on the account, not just the one logged in). Without
+-- them, Crypt would pass names through untouched and your alts' names would sit
+-- in plaintext in the middle of an otherwise obfuscated message. '~' is
+-- deliberately absent: it separates fields outside the payload and must survive
+-- unchanged.
+--
+-- Anything not in this alphabet passes through as-is, so an unexpected
+-- character still round-trips correctly rather than corrupting.
+--
 -- Again: this is obfuscation. It stops casual reading, nothing more.
-BZ.ALPHABET = "0123456789:,;"
-BZ.ALPHABET_LEN = 13
+BZ.ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ:,;=!"
+BZ.ALPHABET_LEN = string.len(BZ.ALPHABET)
 
 -- Deliberately contains every character class the wire format relies on, so
 -- /bz selftest proves whether the channel delivers them unaltered. The pipe is
@@ -209,6 +218,12 @@ function BZ.UpdateOwnData()
     local entry = BZ.data[me] or {}
     entry.realm = GetRealmName()
     entry.time  = time()
+    -- Marks this character as belonging to THIS account, which is what makes a
+    -- sync able to send every character on the account rather than only the one
+    -- logged in. Characters learned from the other box never get this flag, so
+    -- they're never relayed back - each account is the sole authority on its own
+    -- characters, and there are no echoes to arbitrate between.
+    entry.mine  = true
     entry.bags  = BZ.ScanBags()
     if BZ.atBank then
         entry.bank = BZ.ScanBank()
@@ -244,21 +259,37 @@ function BZ.Deserialize(str)
     return counts
 end
 
--- Bags and bank as two ";"-separated sections. The separator is part of
--- BZ.ALPHABET so it gets rotated along with everything else rather than
--- standing out as plaintext structure in an otherwise obfuscated payload.
-function BZ.SerializeEntry(entry)
-    return BZ.Serialize(entry.bags) .. ";" .. BZ.Serialize(entry.bank)
+-- One character: "Name=<bags>;<bank>", where each half is "id:count,id:count".
+-- Several characters: blocks joined with "!". Every separator is part of
+-- BZ.ALPHABET so it's rotated along with the data rather than standing out as
+-- plaintext structure in an otherwise obfuscated payload.
+function BZ.SerializeEntry(name, entry)
+    return name .. "=" .. BZ.Serialize(entry.bags) .. ";" .. BZ.Serialize(entry.bank)
 end
 
-function BZ.DeserializeEntry(str)
-    local _, _, bags, bank = string.find(str or "", "^([^;]*);(.*)$")
-    if not bags then
-        -- No separator: a sender from before the bank existed. Treat the whole
-        -- thing as bags rather than discarding it.
-        return BZ.Deserialize(str), nil
+function BZ.SerializePayload(names)
+    local blocks = {}
+    for _, name in ipairs(names) do
+        local entry = BZ.data[name]
+        if entry then table.insert(blocks, BZ.SerializeEntry(name, entry)) end
     end
-    return BZ.Deserialize(bags), BZ.Deserialize(bank)
+    return table.concat(blocks, "!")
+end
+
+-- Returns a list of { name, bags, bank }.
+function BZ.DeserializePayload(str)
+    local characters = {}
+    for block in string.gfind(str or "", "[^!]+") do
+        local _, _, name, bags, bank = string.find(block, "^([^=]+)=([^;]*);(.*)$")
+        if name then
+            table.insert(characters, {
+                name = name,
+                bags = BZ.Deserialize(bags),
+                bank = BZ.Deserialize(bank),
+            })
+        end
+    end
+    return characters
 end
 
 -- Every channel we could currently reach a paired box on, narrowest first.
@@ -328,7 +359,29 @@ function BZ.SendBeacon()
     end
 end
 
-function BZ.SendInventory()
+-- Every character that has logged in on this account, most recently seen first
+-- so a partial transfer still delivers the ones you're likeliest to care about.
+function BZ.OwnedCharacters()
+    local names = {}
+    for name, entry in pairs(BZ.data) do
+        if entry.mine then table.insert(names, name) end
+    end
+    table.sort(names, function(a, b)
+        return (BZ.data[a].time or 0) > (BZ.data[b].time or 0)
+    end)
+    return names
+end
+
+-- scope "all" sends every character on this account; anything else sends only
+-- the one logged in.
+--
+-- The two exist because they answer different needs. Meeting the other box, or
+-- asking for a sync, should hand over the whole roster - that's the entire
+-- point, since the other characters aren't online to speak for themselves. But
+-- a bag change only ever concerns the character who made it, and re-sending
+-- five characters' inventories every time you loot something would be pure
+-- waste.
+function BZ.SendInventory(scope)
     local password = BZ.config.password
     if not password or password == "" then
         BZ.Debug("no password set - refusing to send")
@@ -345,8 +398,15 @@ function BZ.SendInventory()
     end
 
     local me = BZ.Me()
-    local own = BZ.data[me]
-    if not own then return end
+    local names
+    if scope == "all" then
+        names = BZ.OwnedCharacters()
+    elseif BZ.data[me] then
+        names = { me }
+    else
+        names = {}
+    end
+    if table.getn(names) == 0 then return end
 
     local nonce = math.random(100000, 999999)
     -- Resolve the tag before building anything. Without this the no-password
@@ -356,13 +416,16 @@ function BZ.SendInventory()
     local tag = BZ.Tag(nonce)
     if not tag then return end
 
-    local payload = BZ.Crypt(BZ.SerializeEntry(own), nonce, false)
+    local payload = BZ.Crypt(BZ.SerializePayload(names), nonce, false)
 
     local total = math.ceil(string.len(payload) / BZ.MAX_PAYLOAD)
     if total < 1 then total = 1 end
 
     for _, channel in ipairs(channels) do
-        BZ.Queue("H~" .. nonce .. "~" .. tag .. "~" .. me .. "~" ..
+        -- The "2" is the wire format version. A client that doesn't recognise it
+        -- ignores the whole transfer rather than half-parsing a format it
+        -- doesn't understand and storing nonsense.
+        BZ.Queue("H~2~" .. nonce .. "~" .. tag .. "~" ..
             (BZ.config.account or "") .. "~" .. total, channel)
         for i = 1, total do
             local from = (i - 1) * BZ.MAX_PAYLOAD + 1
@@ -372,8 +435,8 @@ function BZ.SendInventory()
     end
     BZ.inventoryDirty = false
     BZ.lastInventorySend = time()
-    BZ.Debug("queued inventory: " .. total .. " chunk(s), " .. string.len(payload) .. " chars, to " ..
-        table.concat(channels, "+"))
+    BZ.Debug("queued " .. table.getn(names) .. " character(s) in " .. total .. " chunk(s), " ..
+        string.len(payload) .. " chars, to " .. table.concat(channels, "+"))
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -425,24 +488,35 @@ function BZ.OnAddonMessage(msg, sender)
         BZ.Debug("paired beacon from " .. name)
         -- Someone we trust is here: send ours, but only if it's changed since
         -- last time or we've never met them.
-        if firstSeen or BZ.inventoryDirty then
+        -- Meeting a box for the first time hands over the WHOLE roster: the
+        -- other characters aren't online to speak for themselves, and that is
+        -- the entire reason the account keeps a list of them.
+        if firstSeen then
+            BZ.SendInventory("all")
+        elseif BZ.inventoryDirty then
             BZ.SendInventory()
         end
 
     elseif kind == "H" then
-        local _, _, nonce, tag, name, account, total =
-            string.find(rest, "^(%d+)~(%d+)~([^~]+)~([^~]*)~(%d+)$")
+        local _, _, version, nonce, tag, account, total =
+            string.find(rest, "^(%d+)~(%d+)~(%d+)~([^~]*)~(%d+)$")
         if not nonce then return end
+        if version ~= "2" then
+            BZ.stats.rejected = BZ.stats.rejected + 1
+            BZ.Debug("wire format v" .. tostring(version) .. " from " .. tostring(sender) ..
+                " - update both boxes to the same version")
+            return
+        end
         if tag ~= BZ.Tag(nonce) then
             BZ.stats.rejected = BZ.stats.rejected + 1
-            BZ.Debug("header from " .. tostring(name) .. " failed the password check - ignored")
+            BZ.Debug("header from " .. tostring(sender) .. " failed the password check - ignored")
             return
         end
         BZ.incoming[sender] = {
-            nonce = nonce, name = name, account = account,
+            nonce = nonce, account = account,
             expected = tonumber(total), chunks = {},
         }
-        BZ.Debug("incoming inventory from " .. name .. " (" .. total .. " chunks)")
+        BZ.Debug("incoming transfer from " .. tostring(sender) .. " (" .. total .. " chunks)")
 
     elseif kind == "D" then
         local _, _, nonce, index, data = string.find(rest, "^(%d+)~(%d+)~(.*)$")
@@ -462,30 +536,40 @@ function BZ.OnAddonMessage(msg, sender)
         for i = 1, pending.expected do
             joined = joined .. (pending.chunks[i] or "")
         end
-        local bags, bank = BZ.DeserializeEntry(BZ.Crypt(joined, pending.nonce, true))
+        local characters = BZ.DeserializePayload(BZ.Crypt(joined, pending.nonce, true))
+        local updated = {}
 
-        local nBags, nBank = 0, 0
-        for _ in pairs(bags or {}) do nBags = nBags + 1 end
-        for _ in pairs(bank or {}) do nBank = nBank + 1 end
+        for _, incoming in ipairs(characters) do
+            local nBank = 0
+            for _ in pairs(incoming.bank or {}) do nBank = nBank + 1 end
 
-        local entry = BZ.data[pending.name] or {}
-        entry.realm   = GetRealmName()
-        entry.time    = time()
-        entry.account = (pending.account ~= "" and pending.account) or entry.account
-        entry.bags    = bags
-        -- Only replace a known bank with a non-empty one: the sender may not have
-        -- visited a bank yet this session, and an empty section from them
-        -- shouldn't erase what we already had.
-        if bank and nBank > 0 then
-            entry.bank = bank
-            entry.bankTime = time()
+            local entry = BZ.data[incoming.name] or {}
+            entry.realm   = GetRealmName()
+            entry.time    = time()
+            entry.account = (pending.account ~= "" and pending.account) or entry.account
+            entry.bags    = incoming.bags
+            -- Never flagged mine: a character learned from the other box belongs
+            -- to that account, and relaying it back would create an echo whose
+            -- staleness we'd then have to arbitrate against the original.
+            entry.mine    = nil
+            -- Only replace a known bank with a non-empty one: the sender may not
+            -- have visited a bank yet, and an empty section shouldn't erase what
+            -- we already had.
+            if nBank > 0 then
+                entry.bank = incoming.bank
+                entry.bankTime = time()
+            end
+
+            BZ.data[incoming.name] = entry
+            table.insert(updated, BZ.DisplayName(incoming.name))
         end
 
-        BZ.data[pending.name] = entry
         Bagertz_Data = BZ.data
         BZ.incoming[sender] = nil
-        BZ.Say("updated " .. BZ.DisplayName(pending.name) .. " - " .. nBags ..
-            " item types in bags" .. (nBank > 0 and (", " .. nBank .. " in bank") or "") .. ".")
+        if table.getn(updated) > 0 then
+            BZ.Say("updated " .. table.getn(updated) .. " character(s): " ..
+                table.concat(updated, ", "))
+        end
     end
 end
 
@@ -634,8 +718,9 @@ SlashCmdList["BAGERTZ"] = function(msg)
         else
             BZ.UpdateOwnData()
             BZ.SendBeacon()
-            BZ.SendInventory()
-            BZ.Say("syncing...")
+            BZ.SendInventory("all")
+            BZ.Say("syncing " .. table.getn(BZ.OwnedCharacters()) ..
+                " character(s) from this account...")
         end
 
     elseif cmd == "forget" and words[2] then
@@ -749,7 +834,17 @@ SlashCmdList["BAGERTZ"] = function(msg)
             local types = 0
             for _ in pairs(entry.bags or {}) do types = types + 1 end
             local age = entry.time and math.floor((time() - entry.time) / 60) or nil
-            BZ.Say("  " .. (name == me and "|cFF00FF7F" .. name .. " (you)|r" or name) ..
+            local label
+            if name == me then
+                label = "|cFF00FF7F" .. BZ.DisplayName(name) .. " (you)|r"
+            elseif entry.mine then
+                -- On this account, so we send it to the other box on their behalf
+                -- even while they're offline.
+                label = BZ.DisplayName(name) .. " |cFF888888(this account)|r"
+            else
+                label = BZ.DisplayName(name) .. " |cFF888888(learned)|r"
+            end
+            BZ.Say("  " .. label ..
                 " - " .. types .. " item types" ..
                 (age and (", updated " .. age .. "m ago") or ""))
         end

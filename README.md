@@ -1,4 +1,4 @@
-# Bagertz (v1.1.0)
+# Bagertz (v1.2.0)
 
 Shows how many of an item your **other characters** are carrying, right in the item's tooltip — including characters on a **different WoW account**, which is the part nothing else does.
 
@@ -22,7 +22,9 @@ The cross-account data therefore arrives **through the game rather than off the 
 
 That also makes it safe for dual-boxing specifically. The obvious alternative — pointing both accounts at one shared file with a hardlink or directory junction — silently destroys data: each client holds its whole SavedVariables table in memory and rewrites the entire file on exit, so whichever client closes **last** overwrites the other one's entire session. Here, each client only ever writes its own account's file, so two clients running at once can't collide.
 
-**The trade:** a character has to be dual-boxed with you once to be learned. After that it stays cached and shows up in tooltips whether or not it's online.
+A sync hands over **every character on the account**, not just the one logged in. Each account keeps a roster of the characters that have played on it, so when the two boxes meet, each one delivers its whole roster on the other's behalf - your alts do not have to be online, or ever have been dual-boxed, to show up in tooltips. They only need to have logged in once on their own account so their bags were recorded.
+
+Characters learned from the other box are never relayed onward. Each account is the sole authority on its own characters, which means there are no echoes to arbitrate between and no way for a stale copy to overwrite a fresh one.
 
 ## Pairing, and what the password actually protects
 
@@ -97,7 +99,7 @@ It is set per account, not per character, so it is one command per box and every
 ## Known limitations
 
 - **Bank counts are a snapshot from the last bank visit.** Bank contents are readable only while the bank frame is open - away from a bank those containers report nothing at all. So the bank is scanned while you stand there and then kept. A character who has not visited a bank since installing this shows no bank count until they do.
-- **A character must be dual-boxed with you once** before it appears. There's no way to import one that never met your other box.
+- **A character must have logged in once with this addon installed** before it has anything to share. It does not need to be online, or dual-boxed with you - the account sends it on its behalf - but a character that has never played with Bagertz has no recorded bags.
 - **Both boxes need this addon.** It syncs with itself, not with Bagnon or Bagshui.
 - **The counts are a snapshot** taken when the other box last sent, not a live feed. It re-sends when its bags change and it can see a paired box.
 

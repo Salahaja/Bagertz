@@ -404,6 +404,98 @@ do
 end
 
 -- ---------------------------------------------------------------------------
+print("a sync hands over every character on the account, not just the one online")
+do
+    local a = newClient("Alice", ALICE_BAGS)
+    local b = newClient("Bob", { [0] = {} })
+    activate(a); a.BZ.config.password = "shared"; a.BZ.config.account = "MAIN"
+    activate(b); b.BZ.config.password = "shared"; b.BZ.UpdateOwnData()
+
+    activate(a)
+    a.BZ.UpdateOwnData()
+    -- Two alts on this account that are NOT logged in - the whole reason the
+    -- account keeps a roster.
+    a.BZ.data["Mahidot"]  = { mine = true, time = 100, bags = { [555] = 7 }, bank = { [555] = 70 } }
+    a.BZ.data["Mahislap"] = { mine = true, time = 200, bags = { [666] = 9 } }
+    -- And one learned from elsewhere, which must NOT be relayed back.
+    a.BZ.data["Stranger"] = { time = 300, bags = { [999] = 1 } }
+
+    check("owned roster is the three on this account", table.getn(a.BZ.OwnedCharacters()), 3)
+
+    -- Bob beacons; Alice hears a new peer and hands over the whole roster.
+    activate(b); b.BZ.SendBeacon()
+    deliver(b, a)
+    deliver(a, b)
+
+    activate(b)
+    check("Bob learned the online character", b.BZ.data["Alice"] ~= nil, true)
+    check("Bob learned an offline alt", b.BZ.data["Mahidot"] ~= nil, true)
+    check("  with its bags", b.BZ.data["Mahidot"].bags[555], 7)
+    check("  and its bank", b.BZ.data["Mahidot"].bank[555], 70)
+    check("Bob learned the second alt", b.BZ.data["Mahislap"].bags[666], 9)
+    check("all carry the sender's account label", b.BZ.data["Mahidot"].account, "MAIN")
+    check("a learned character is NOT relayed on", b.BZ.data["Stranger"], nil)
+    check("learned characters aren't marked as Bob's own", b.BZ.data["Mahidot"].mine, nil)
+    check("Bob's own roster is still just Bob", table.getn(b.BZ.OwnedCharacters()), 1)
+end
+
+-- ---------------------------------------------------------------------------
+print("a bag change re-sends only the character that changed")
+do
+    local a = newClient("Alice", ALICE_BAGS)
+    local b = newClient("Bob", { [0] = {} })
+    activate(a); a.BZ.config.password = "shared"
+    activate(b); b.BZ.config.password = "shared"
+
+    activate(a)
+    a.BZ.UpdateOwnData()
+    a.BZ.data["Mahidot"] = { mine = true, time = 100, bags = { [555] = 7 } }
+    a.BZ.peers["Bob"] = { time = os.time(), channel = "PARTY" }
+
+    a.BZ.SendInventory()          -- self only, as a bag change would
+    deliver(a, b)
+    activate(b)
+    check("only the online character arrived", b.BZ.data["Mahidot"], nil)
+    check("  and that one did", b.BZ.data["Alice"] ~= nil, true)
+
+    activate(a); a.BZ.SendInventory("all")
+    deliver(a, b)
+    activate(b)
+    check("an explicit full sync brings the alt too", b.BZ.data["Mahidot"].bags[555], 7)
+end
+
+-- ---------------------------------------------------------------------------
+print("character names are obfuscated rather than sent in the clear")
+do
+    local a = newClient("Alice", ALICE_BAGS)
+    activate(a)
+    a.BZ.config.password = "shared"
+    a.BZ.UpdateOwnData()
+    a.BZ.data["Mahislap"] = { mine = true, time = 100, bags = { [666] = 9 } }
+    a.BZ.peers["Bob"] = { time = os.time(), channel = "PARTY" }
+    a.BZ.SendInventory("all")
+    while table.getn(a.BZ.sendQueue) > 0 do a.BZ.DrainQueue() end
+
+    local leaked = false
+    for _, m in ipairs(a.sent) do
+        if string.find(m.msg, "Mahislap", 1, true) then leaked = true end
+    end
+    check("an alt's name does not appear in plaintext", leaked, false)
+end
+
+-- ---------------------------------------------------------------------------
+print("a transfer in an unknown wire format is refused, not half-parsed")
+do
+    local a = newClient("Alice", ALICE_BAGS)
+    activate(a)
+    a.BZ.config.password = "shared"
+    local nonce = 123456
+    a.BZ.OnAddonMessage("H~99~" .. nonce .. "~" .. a.BZ.Tag(nonce) .. "~MAIN~1", "Bob")
+    check("no transfer was opened", a.BZ.incoming["Bob"], nil)
+    check("and it was counted as rejected", a.BZ.stats.rejected > 0, true)
+end
+
+-- ---------------------------------------------------------------------------
 print("guild is used as a channel when guilded")
 do
     local a = newClient("Alice", ALICE_BAGS)
