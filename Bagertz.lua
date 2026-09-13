@@ -23,8 +23,13 @@
     ever writes its own account's file, two clients running at once can't
     clobber each other - which a shared file on disk absolutely would.
 
-    The trade is that a character has to be dual-boxed with you once to be
-    learned. After that it stays cached and shows up offline.
+    A sync hands over EVERY character on the account, not just the one logged
+    in (see BZ.OwnedCharacters). Each account keeps a roster of the characters
+    that have played on it, so when the boxes meet, each delivers its whole
+    roster on the others' behalf - your alts need never be online, or ever have
+    been dual-boxed. Characters learned FROM the other box are never relayed
+    onward, which keeps each account the sole authority on its own characters
+    and leaves no echoes to arbitrate between.
 
     Pairing (see BZ.Tag): addon messages are broadcast to the whole PARTY/RAID,
     so a shared password decides whose data you accept and who accepts yours.
