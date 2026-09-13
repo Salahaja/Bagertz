@@ -759,8 +759,9 @@ SlashCmdList["BAGERTZ"] = function(msg)
                     and ("|cFF00FF7F" .. BZ.config.account .. "|r")
                     or "|cFF888888unlabelled|r"))
             BZ.Say("Optional. Everything works unlabelled - you just see \"Salabeard\" rather " ..
-                "than \"ALT/Salabeard\". WoW gives addons no way to read your account name, " ..
-                "so if you want one shown it has to be a label you pick: " ..
+                "than \"Whatever/Salabeard\", where Whatever is a word you pick. " ..
+                "WoW gives addons no way to read your account name, " ..
+                "so if you want one shown it has to come from you: " ..
                 "|cFFFFFFFF/bz account <name>|r, once per account.")
         else
             -- Tildes would break the wire format, which uses them as the field

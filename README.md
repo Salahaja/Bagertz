@@ -73,15 +73,15 @@ Set the same password on both boxes, put the two characters in a party, and they
 ### What a tooltip looks like
 
 ```
-MAIN/Salahaja: 6 in bags, 40 in bank (46)
-ALT/Salabeard: 5 in bags
+Salahaja: 6 in bags, 40 in bank (46)
+Salabeard: 5 in bags
 ```
 
 Your own character is listed first and in green, since it's usually what you're comparing against. Bags and bank are shown separately with a combined total, and a location with none of the item is simply omitted rather than padded with a zero.
 
 ### Account labels
 
-**This is optional.** Everything works without it - you just see `Salabeard` rather than `ALT/Salabeard`. It exists because WoW gives addons **no way to read your account name**: it is only ever a folder name on disk, so if you want an account shown, the word has to come from you.
+**This is optional.** Everything works without it, and the lines above are what you get: just character names. It exists because WoW gives addons **no way to read your account name**: it is only ever a folder name on disk, so if you want an account shown, the word has to come from you.
 
 It is set per account, not per character, so it is one command per box and every character on that account inherits it. The names are yours to pick - match your WTF folders if that is clearer:
 
