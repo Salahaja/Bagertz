@@ -79,14 +79,14 @@ Your own character is listed first and in green, since it's usually what you're 
 
 ### Account labels
 
-WoW gives addons **no way to read your account name** — it exists only as a folder name on disk. So `/bz account <name>` sets a label for whichever account you're logged into, stored in that account's own saved variables and sent along with its data. Run it once on each box:
+**This is optional.** Everything works without it - you just see `Salabeard` rather than `ALT/Salabeard`. It exists because WoW gives addons **no way to read your account name**: it is only ever a folder name on disk, so if you want an account shown, the word has to come from you.
+
+It is set per account, not per character, so it is one command per box and every character on that account inherits it. The names are yours to pick - match your WTF folders if that is clearer:
 
 ```
-/bz account MAIN
-/bz account ALT
+/bz account SALAHAJA
+/bz account SALAMAHI
 ```
-
-Without a label the character name simply stands alone, rather than showing a dangling prefix.
 
 ### If nothing is syncing
 

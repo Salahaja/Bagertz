@@ -667,9 +667,11 @@ SlashCmdList["BAGERTZ"] = function(msg)
             BZ.Say("this account is labelled: " ..
                 ((BZ.config.account and BZ.config.account ~= "")
                     and ("|cFF00FF7F" .. BZ.config.account .. "|r")
-                    or "|cFFFF5179unlabelled|r - use |cFFFFFFFF/bz account <name>|r"))
-            BZ.Say("WoW gives addons no way to read your account name, so this is a label " ..
-                "you choose. Set a different one on each box.")
+                    or "|cFF888888unlabelled|r"))
+            BZ.Say("Optional. Everything works unlabelled - you just see \"Salabeard\" rather " ..
+                "than \"ALT/Salabeard\". WoW gives addons no way to read your account name, " ..
+                "so if you want one shown it has to be a label you pick: " ..
+                "|cFFFFFFFF/bz account <name>|r, once per account.")
         else
             -- Tildes would break the wire format, which uses them as the field
             -- separator.
@@ -717,7 +719,8 @@ SlashCmdList["BAGERTZ"] = function(msg)
             and ("|cFF00FF7F" .. table.concat(reachable, ", ") .. "|r")
             or "|cFFFF5179none|r - not grouped and not in a guild, so nothing can be sent"))
         BZ.Say("account label: " .. ((BZ.config.account and BZ.config.account ~= "")
-            and ("|cFF00FF7F" .. BZ.config.account .. "|r") or "|cFFFF5179unset|r (/bz account <name>)"))
+            and ("|cFF00FF7F" .. BZ.config.account .. "|r")
+            or "|cFF888888none (optional - /bz account <name>)|r"))
 
         local peerNames = {}
         for name in pairs(BZ.peers) do table.insert(peerNames, name) end
