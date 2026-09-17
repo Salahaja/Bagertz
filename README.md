@@ -1,4 +1,4 @@
-# Bagertz (v1.3.0)
+# Bagertz (v1.4.0)
 
 Shows how many of an item your **other characters** are carrying, right in the item's tooltip — including characters on a **different WoW account**, which is the part nothing else does.
 
@@ -78,6 +78,14 @@ Set the same password on both boxes, put the two characters in a party, and they
 Salahaja: 6 in bags, 40 in bank (46)
 Salabeard: 5 in bags
 ```
+
+And when nobody has any:
+
+```
+Owned: 0
+```
+
+That line matters more than it looks. A tooltip with nothing added reads exactly like a broken addon - which is how the missing crafting hooks got reported - and at a crafting window the question being asked is not "who has these mats" but "do I need to go buy them". `/bz zero off` if you would rather it stay quiet.
 
 Your own character is listed first and in green, since it's usually what you're comparing against. Bags and bank are shown separately with a combined total, and a location with none of the item is simply omitted rather than padded with a zero.
 

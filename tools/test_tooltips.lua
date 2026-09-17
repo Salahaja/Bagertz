@@ -190,13 +190,43 @@ do
 end
 
 -- ---------------------------------------------------------------------------
-print("an item nobody else holds adds nothing")
+print("an item nobody holds says ZERO rather than staying bare")
 do
     boot()
     GetMerchantItemLink = function() return link(99999) end
     lines = {}
     GameTooltip:SetMerchantItem(1)
-    check("no line for an unheld item", table.getn(lines), 0)
+    -- A bare tooltip reads identically to a broken addon, which is how this got
+    -- reported as "not showing in crafting frames".
+    check("one line, not silence", table.getn(lines), 1)
+    check("  reading as a count", lines[1], "Owned: 0")
+
+    -- And it must not appear when somebody DOES hold the item.
+    GetMerchantItemLink = function() return link(2589) end
+    lines = {}
+    GameTooltip:SetMerchantItem(1)
+    check("a held item shows the holder, not a zero", lines[1], "Salabeard: 40 in bags")
+    check("  and only that line", table.getn(lines), 1)
+
+    -- Switchable off for anyone who finds a line on every tooltip noisy.
+    BZ.config.showZero = false
+    GetMerchantItemLink = function() return link(99999) end
+    lines = {}
+    GameTooltip:SetMerchantItem(1)
+    check("off means silent again", table.getn(lines), 0)
+    BZ.config.showZero = nil
+end
+
+-- ---------------------------------------------------------------------------
+print("with no character data at all it stays quiet")
+do
+    boot()
+    -- An empty cache must not claim a confident zero for every item in the game.
+    BZ.data = {}
+    GetMerchantItemLink = function() return link(99999) end
+    lines = {}
+    GameTooltip:SetMerchantItem(1)
+    check("no zero line without anything to compare", table.getn(lines), 0)
 end
 
 -- ---------------------------------------------------------------------------

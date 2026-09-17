@@ -54,7 +54,7 @@
 BZ = {}
 BZ.ADDON_NAME = "Bagertz"
 BZ.PREFIX     = "BAGERTZ"
-BZ.VERSION    = "1.3.1"
+BZ.VERSION    = "1.4.0"
 
 BZ.data   = {} -- [charName] = { realm, time, bags = { [itemID] = count } }
 BZ.config = {} -- { password = string, debug = bool }
@@ -640,8 +640,24 @@ function BZ.AddTooltipLines(tooltip, itemID)
         end
     end
     if BZ.config.debugTips and not any then
-        BZ.Say("  item " .. itemID .. ": nobody has any, so no lines added")
+        BZ.Say("  item " .. itemID .. ": nobody holds any")
     end
+
+    -- Say zero out loud rather than adding nothing. A bare tooltip reads exactly
+    -- the same as a broken addon - which is precisely how this was reported, and
+    -- it took a tracing build to tell "nobody has any" apart from "the hook
+    -- never fired". An explicit zero also answers the question actually being
+    -- asked at a crafting window: not "who has these mats" but "do I need to go
+    -- buy them".
+    --
+    -- Only when at least one character is known. With an empty cache every item
+    -- in the game would claim a confident zero, which would be a lie of a
+    -- different kind.
+    if not any and BZ.config.showZero ~= false and table.getn(names) > 0 then
+        tooltip:AddLine("Owned: 0", 0.6, 0.6, 0.6)
+        any = true
+    end
+
     if any then tooltip:Show() end
 end
 
@@ -838,6 +854,16 @@ SlashCmdList["BAGERTZ"] = function(msg)
         Bagertz_Data = BZ.data
         BZ.UpdateOwnData()
         BZ.Say("cleared every cached character.")
+
+    elseif cmd == "zero" then
+        if string.lower(words[2] or "") == "off" then
+            BZ.config.showZero = false
+            BZ.Say("zero lines off - tooltips stay bare when nobody holds the item.")
+        else
+            BZ.config.showZero = true
+            BZ.Say("zero lines on - a tooltip says so when nobody holds the item.")
+        end
+        Bagertz_Config = BZ.config
 
     elseif cmd == "tips" then
         BZ.config.debugTips = not BZ.config.debugTips

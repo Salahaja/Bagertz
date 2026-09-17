@@ -312,7 +312,10 @@ do
 
     lines = {}
     a.BZ.AddTooltipLines(tip, 999999)
-    check("nothing for an item nobody has", table.getn(lines), 0)
+    -- Deliberately a line, not silence: a bare tooltip reads exactly like a
+    -- broken addon, which is how the missing crafting hooks got reported.
+    check("an item nobody has says so", table.getn(lines), 1)
+    check("  as a count", lines[1], "Owned: 0")
 end
 
 -- ---------------------------------------------------------------------------
