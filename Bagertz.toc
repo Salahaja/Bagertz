@@ -1,5 +1,5 @@
 ## Interface: 11200
-## Version: 1.3.0
+## Version: 1.3.1
 ## Title: Bagertz
 ## Notes: Shows how many of an item your other characters are carrying - including characters on a different WoW account, by syncing between two running clients while you dual-box. Password-paired.
 ## Author: You

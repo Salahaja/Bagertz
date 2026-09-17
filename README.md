@@ -65,6 +65,8 @@ Set the same password on both boxes, put the two characters in a party, and they
 /bz selftest            prove whether the channel delivers messages intact
 /bz forget <name>       drop one cached character
 /bz clear               drop every cached character
+/bz tips                trace every tooltip this addon hooks, for working out
+                        why a particular frame shows no counts
 /bz debug               verbose logging, for working out why a sync is not happening
 ```
 

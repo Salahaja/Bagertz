@@ -54,7 +54,7 @@
 BZ = {}
 BZ.ADDON_NAME = "Bagertz"
 BZ.PREFIX     = "BAGERTZ"
-BZ.VERSION    = "1.3.0"
+BZ.VERSION    = "1.3.1"
 
 BZ.data   = {} -- [charName] = { realm, time, bags = { [itemID] = count } }
 BZ.config = {} -- { password = string, debug = bool }
@@ -603,7 +603,10 @@ function BZ.DisplayName(name)
 end
 
 function BZ.AddTooltipLines(tooltip, itemID)
-    if not itemID then return end
+    if not itemID then
+        if BZ.config.debugTips then BZ.Say("  no item id could be parsed from that link") end
+        return
+    end
 
     local me = BZ.Me()
     local names = {}
@@ -635,6 +638,9 @@ function BZ.AddTooltipLines(tooltip, itemID)
             end
             any = true
         end
+    end
+    if BZ.config.debugTips and not any then
+        BZ.Say("  item " .. itemID .. ": nobody has any, so no lines added")
     end
     if any then tooltip:Show() end
 end
@@ -736,9 +742,21 @@ function BZ.HookTooltipFrame(tooltip)
         if orig and not tooltip[flag] then
             tooltip[flag] = true
             local getLink = entry.link
+            local methodName = entry.method
             tooltip[entry.method] = function(a, b, c, d, e)
                 local ret = orig(a, b, c, d, e)
                 local ok, link = pcall(getLink, a, b, c, d, e)
+                -- /bz tips. There are three quite different reasons a tooltip can
+                -- come up bare, and they are indistinguishable from the outside:
+                -- the method never fires (that frame uses a different tooltip or
+                -- different method), it fires but the link getter returns nil
+                -- (wrong getter or wrong arguments), or both work and we simply
+                -- hold none of that item. This says which.
+                if BZ.config.debugTips then
+                    BZ.Say("tip |cFFFFFFFF" .. methodName .. "|r(" ..
+                        tostring(b) .. ", " .. tostring(c) .. ") -> " ..
+                        (ok and tostring(link) or "|cFFFF5179getter errored|r"))
+                end
                 if ok and link then
                     BZ.AddTooltipLines(a, BZ.ItemIDFromLink(link))
                 end
@@ -820,6 +838,16 @@ SlashCmdList["BAGERTZ"] = function(msg)
         Bagertz_Data = BZ.data
         BZ.UpdateOwnData()
         BZ.Say("cleared every cached character.")
+
+    elseif cmd == "tips" then
+        BZ.config.debugTips = not BZ.config.debugTips
+        Bagertz_Config = BZ.config
+        BZ.Say("tooltip tracing: " .. (BZ.config.debugTips and
+            "|cFF00FF7Fon|r - hover something in the frame that is not working" or
+            "|cFFFF5179off|r"))
+        if BZ.config.debugTips then
+            BZ.Say("hooks installed on this session: " .. tostring(BZ.hookCount))
+        end
 
     elseif cmd == "debug" then
         BZ.config.debug = not BZ.config.debug
