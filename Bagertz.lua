@@ -54,7 +54,7 @@
 BZ = {}
 BZ.ADDON_NAME = "Bagertz"
 BZ.PREFIX     = "BAGERTZ"
-BZ.VERSION    = "1.2.0"
+BZ.VERSION    = "1.3.0"
 
 BZ.data   = {} -- [charName] = { realm, time, bags = { [itemID] = count } }
 BZ.config = {} -- { password = string, debug = bool }
@@ -639,48 +639,122 @@ function BZ.AddTooltipLines(tooltip, itemID)
     if any then tooltip:Show() end
 end
 
-function BZ.HookTooltips()
-    local origSetBagItem = GameTooltip.SetBagItem
-    GameTooltip.SetBagItem = function(self, bag, slot)
-        local ret = origSetBagItem(self, bag, slot)
-        BZ.AddTooltipLines(self, BZ.ItemIDFromLink(GetContainerItemLink(bag, slot)))
-        return ret
-    end
+-- Every way the client puts an item into a tooltip. Each entry names the
+-- tooltip method and a function that returns that item's link from the SAME
+-- arguments the method was called with.
+--
+-- The first version hooked four of these, which is why counts only appeared in
+-- your bags. Crafting frames call SetCraftItem / SetCraftSpell /
+-- SetTradeSkillItem, a merchant calls SetMerchantItem, the auction house calls
+-- SetAuctionItem - none were covered, so the tooltip appeared without our lines.
+-- This list is modelled on Bagshui's, which is the working reference for it on
+-- this client.
+--
+-- Explicit parameters per entry rather than varargs: Lua 5.0 exposes varargs as
+-- a local table named `arg`, which is also the name of WoW's event-argument
+-- globals, and these run inside the tooltip code path where shadowing that is
+-- an unhelpful surprise.
+--
+-- SetAuctionSellItem, SetInboxItem and SetSendMailItem are deliberately absent.
+-- Vanilla gives no link for those - only a name and a texture - so identifying
+-- the item would need a name-to-item catalogue this addon does not keep. They
+-- show no counts rather than wrong ones.
+BZ.TOOLTIP_HOOKS = {
+    { method = "SetBagItem",
+      link = function(self, bag, slot) return GetContainerItemLink(bag, slot) end },
 
-    -- Explicit parameters rather than varargs throughout: Lua 5.0 exposes
-    -- varargs as a local table named `arg`, which is also the name of WoW's
-    -- event-argument globals, and these hooks run from inside the tooltip code
-    -- path where that is an unhelpful thing to shadow.
-    local origSetHyperlink = GameTooltip.SetHyperlink
-    GameTooltip.SetHyperlink = function(self, link, count)
-        local ret = origSetHyperlink(self, link, count)
-        BZ.AddTooltipLines(self, BZ.ItemIDFromLink(link))
-        return ret
-    end
+    { method = "SetInventoryItem",
+      link = function(self, unit, slotID) return GetInventoryItemLink(unit, slotID) end },
 
-    local origSetLootItem = GameTooltip.SetLootItem
-    if origSetLootItem then
-        GameTooltip.SetLootItem = function(self, slot)
-            local ret = origSetLootItem(self, slot)
-            BZ.AddTooltipLines(self, BZ.ItemIDFromLink(GetLootSlotLink(slot)))
-            return ret
+    { method = "SetHyperlink",
+      link = function(self, link) return link end },
+
+    { method = "SetLootItem",
+      link = function(self, slot) return GetLootSlotLink(slot) end },
+
+    { method = "SetLootRollItem",
+      link = function(self, id) return GetLootRollItemLink(id) end },
+
+    { method = "SetMerchantItem",
+      link = function(self, index) return GetMerchantItemLink(index) end },
+
+    { method = "SetBuybackItem",
+      link = function(self, index) return GetBuybackItemLink(index) end },
+
+    -- Professions come in two flavours in vanilla: enchanting and a few others
+    -- use the Craft API, everything else uses TradeSkill. Both distinguish the
+    -- item being made (no slot) from one of its reagents (slot given), and the
+    -- reagents are the whole point here - "do I already have these mats?"
+    { method = "SetCraftItem",
+      link = function(self, skill, slot)
+          if slot then return GetCraftReagentItemLink and GetCraftReagentItemLink(skill, slot) end
+          return GetCraftItemLink and GetCraftItemLink(skill)
+      end },
+
+    { method = "SetCraftSpell",
+      link = function(self, slot) return GetCraftItemLink and GetCraftItemLink(slot) end },
+
+    { method = "SetTradeSkillItem",
+      link = function(self, skill, slot)
+          if slot then
+              return GetTradeSkillReagentItemLink and GetTradeSkillReagentItemLink(skill, slot)
+          end
+          return GetTradeSkillItemLink and GetTradeSkillItemLink(skill)
+      end },
+
+    { method = "SetQuestItem",
+      link = function(self, qtype, slot) return GetQuestItemLink(qtype, slot) end },
+
+    { method = "SetQuestLogItem",
+      link = function(self, qtype, slot) return GetQuestLogItemLink(qtype, slot) end },
+
+    { method = "SetTradePlayerItem",
+      link = function(self, index) return GetTradePlayerItemLink(index) end },
+
+    { method = "SetTradeTargetItem",
+      link = function(self, index) return GetTradeTargetItemLink(index) end },
+
+    { method = "SetAuctionItem",
+      link = function(self, atype, index) return GetAuctionItemLink(atype, index) end },
+}
+
+-- Installs every hook a given tooltip actually has. A method the frame doesn't
+-- have is skipped rather than erroring - ItemRefTooltip has far fewer than
+-- GameTooltip.
+--
+-- The original is called exactly once and its return passed straight back; our
+-- line-adding runs afterwards inside a pcall, so a link getter that misbehaves
+-- on some server-custom item degrades to "no counts on this tooltip" instead of
+-- breaking the tooltip itself.
+function BZ.HookTooltipFrame(tooltip)
+    if not tooltip then return 0 end
+    local installed = 0
+
+    for _, entry in ipairs(BZ.TOOLTIP_HOOKS) do
+        local orig = tooltip[entry.method]
+        local flag = "bzHooked" .. entry.method
+        if orig and not tooltip[flag] then
+            tooltip[flag] = true
+            local getLink = entry.link
+            tooltip[entry.method] = function(a, b, c, d, e)
+                local ret = orig(a, b, c, d, e)
+                local ok, link = pcall(getLink, a, b, c, d, e)
+                if ok and link then
+                    BZ.AddTooltipLines(a, BZ.ItemIDFromLink(link))
+                end
+                return ret
+            end
+            installed = installed + 1
         end
     end
 
-    local origSetInventoryItem = GameTooltip.SetInventoryItem
-    GameTooltip.SetInventoryItem = function(self, unit, slotID)
-        local ret = origSetInventoryItem(self, unit, slotID)
-        BZ.AddTooltipLines(self, BZ.ItemIDFromLink(GetInventoryItemLink(unit, slotID)))
-        return ret
-    end
-
-    local origRefSetHyperlink = ItemRefTooltip.SetHyperlink
-    ItemRefTooltip.SetHyperlink = function(self, link, count)
-        local ret = origRefSetHyperlink(self, link, count)
-        BZ.AddTooltipLines(self, BZ.ItemIDFromLink(link))
-        return ret
-    end
+    return installed
 end
+
+function BZ.HookTooltips()
+    BZ.hookCount = BZ.HookTooltipFrame(GameTooltip) + BZ.HookTooltipFrame(ItemRefTooltip)
+end
+
 
 -- ---------------------------------------------------------------------------------------------
 -- Slash commands

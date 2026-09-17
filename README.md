@@ -1,4 +1,4 @@
-# Bagertz (v1.2.0)
+# Bagertz (v1.3.0)
 
 Shows how many of an item your **other characters** are carrying, right in the item's tooltip — including characters on a **different WoW account**, which is the part nothing else does.
 
@@ -101,6 +101,7 @@ It is set per account, not per character, so it is one command per box and every
 - **Bank counts are a snapshot from the last bank visit.** Bank contents are readable only while the bank frame is open - away from a bank those containers report nothing at all. So the bank is scanned while you stand there and then kept. A character who has not visited a bank since installing this shows no bank count until they do.
 - **A character must have logged in once with this addon installed** before it has anything to share. It does not need to be online, or dual-boxed with you - the account sends it on its behalf - but a character that has never played with Bagertz has no recorded bags.
 - **Both boxes need this addon.** It syncs with itself, not with Bagnon or Bagshui.
+- **Mail attachments, the auction "sell" slot and outgoing mail show no counts.** Vanilla gives no item link for those three - only a name and a texture - so identifying the item would need a name-to-item catalogue this addon does not keep. They show nothing rather than something wrong.
 - **The counts are a snapshot** taken when the other box last sent, not a live feed. It re-sends when its bags change and it can see a paired box.
 
 ## Development
@@ -110,6 +111,7 @@ It is set per account, not per character, so it is one command per box and every
 ```
 lua tools/vanilla_lint.lua Bagertz.lua
 lua tools/test_sync.lua
+lua tools/test_tooltips.lua
 ```
 
 `vanilla_lint.lua` checks the source against what 1.12 actually runs — any Lua you can install today is 5.4 while vanilla is 5.0, so `#`, `%`, `goto`, `//` and bitwise operators all parse cleanly and then throw a script error in-game.
