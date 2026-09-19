@@ -291,6 +291,12 @@ function BZ.ReadOthers()
             local parsed, entry = BZ.Deserialize(readFile(BZ.FileFor(name)))
             if parsed then
                 entry.mine = false
+                --[[ Stamped with WHEN it was read, so "is this actually coming
+                     from the folder, or is it left over from the version that
+                     synced over addon messages?" has an answer. Old cached
+                     characters are indistinguishable from new ones otherwise,
+                     and a wrong count that looks right is the worst kind. ]]
+                entry.fromFile = time()
                 BZ.data[parsed] = entry
                 found = found + 1
             end
@@ -618,7 +624,7 @@ SlashCmdList["BAGERTZ"] = function(msg)
             and ("|cFF00FF7F" .. BZ.config.account .. "|r")
             or "|cFF888888none (optional - /bz account <name>)|r"))
 
-        local names = {}
+        local names, stale = {}, 0
         for name in pairs(BZ.data) do table.insert(names, name) end
         table.sort(names)
         BZ.Say("known characters:")
@@ -627,18 +633,30 @@ SlashCmdList["BAGERTZ"] = function(msg)
             local types = 0
             for _ in pairs(entry.bags or {}) do types = types + 1 end
             local age = entry.time and math.floor((time() - entry.time) / 60) or nil
+            --[[ Where it came from, not merely who it is. This is the
+                 question worth answering after an upgrade. ]]
             local label
             if name == me then
-                label = BZ.DisplayName(name) .. " |cFF888888(this character)|r"
-            elseif entry.mine then
-                -- Written by us on an earlier login; still ours to rewrite.
-                label = BZ.DisplayName(name) .. " |cFF888888(this account)|r"
+                label = BZ.DisplayName(name) .. " |cFF888888(this character, live)|r"
+            elseif entry.fromFile then
+                label = BZ.DisplayName(name) .. " |cFF00FF7F(from the folder)|r"
             else
-                label = BZ.DisplayName(name) .. " |cFF888888(from the folder)|r"
+                stale = stale + 1
+                label = BZ.DisplayName(name) ..
+                    " |cFFFF5179(cached, NOT from the folder)|r"
             end
             BZ.Say("  " .. label ..
                 " - " .. types .. " item types" ..
                 (age and (", updated " .. age .. "m ago") or ""))
+        end
+        if stale > 0 then
+            --[[ The honest answer to "is it working, or am I looking at what
+                 the old version left behind?" Nothing else can tell them
+                 apart: a cached count looks exactly like a fresh one. ]]
+            BZ.Say("|cFFFF5179" .. stale .. " character(s) above are left over " ..
+                "from the version that synced over addon messages|r - they have " ..
+                "no file in the folder. |cFFFFFFFF/bz clear|r drops them; each " ..
+                "one reappears once you log it in.")
         end
         if table.getn(names) <= 1 then
             BZ.Say("|cFF888888Only this character so far. Log another one in " ..

@@ -282,5 +282,42 @@ bob.BZ.ReadOthers()
 check("a bank scanned at the bank survives walking away",
     bob.BZ.data["Alice"].bank[2589], 100)
 
+----------------------------------------------------------------------
+-- telling fresh data from what the old version left behind
+----------------------------------------------------------------------
+
+--[[ After the upgrade, SavedVariables still hold every character the addon
+     -message version ever cached. A count from that cache looks exactly like
+     one read a second ago, which makes "is this actually working?"
+     unanswerable -- so the data says where it came from. ]]
+resetFolder()
+alice = newClient("Alice", ALICE_BAGS)
+bob = newClient("Bob", BOB_BAGS)
+login(alice)
+login(bob)
+activate(alice)
+alice.BZ.ReadOthers()
+
+check("a character read from the folder says so",
+    alice.BZ.data["Bob"].fromFile ~= nil, true)
+
+-- What an upgrade leaves behind: a name in the cache with no file at all.
+alice.BZ.data["Ghost"] = { realm = "N'Zoth", time = NOW, bags = { [2589] = 50 } }
+alice.BZ.ReadOthers()
+check("a leftover cached character does not claim to be",
+    alice.BZ.data["Ghost"].fromFile, nil)
+check("and re-reading does not invent a source for it",
+    alice.BZ.data["Ghost"].bags[2589], 50)
+
+--[[ Clearing is the way out, and it has to actually remove the leftovers
+     rather than merely hide them. ]]
+SlashCmdList["BAGERTZ"]("clear")
+check("clearing drops the leftover", alice.BZ.data["Ghost"], nil)
+alice.BZ.ReadOthers()
+check("and the real character comes straight back from the folder",
+    alice.BZ.data["Bob"].bags[2589], 7)
+check("still marked as having come from it",
+    alice.BZ.data["Bob"].fromFile ~= nil, true)
+
 print(string.format("\n%d checks, %d failed\n", checks, failures))
 if failures > 0 then os.exit(1) end
