@@ -47,7 +47,8 @@ A file on your own disk is read by nothing but the clients already running on it
 | `/bz account <name>` | Label this account, shown beside its characters |
 | `/bz zero on\|off` | Whether a tooltip says so when nobody holds the item |
 | `/bz forget <name>` | Drop one cached character |
-| `/bz clear` | Drop every cached character |
+| `/bz stale` | Drop only characters with no file behind them (post-upgrade leftovers) |
+| `/bz clear` | Drop everything cached; anything with a file returns at once |
 | `/bz tips` | Trace which tooltip hooks fire |
 | `/bz debug` | Verbose logging |
 

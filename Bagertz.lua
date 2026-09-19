@@ -550,11 +550,40 @@ SlashCmdList["BAGERTZ"] = function(msg)
             BZ.Say("no cached character called \"" .. words[2] .. "\".")
         end
 
+    elseif cmd == "stale" then
+        --[[ Drop only what has no file behind it.
+
+             After the upgrade the cache still holds every character the
+             addon-message version ever heard of, and those counts are frozen
+             at whenever that sync last ran. "Clear everything" would work, but
+             it also throws away the characters that ARE current, and then the
+             tooltips look broken for a moment for no reason. ]]
+        BZ.ReadOthers()
+        local me, dropped = BZ.Me(), {}
+        for name, entry in pairs(BZ.data) do
+            if name ~= me and not entry.fromFile then table.insert(dropped, name) end
+        end
+        for _, name in ipairs(dropped) do BZ.data[name] = nil end
+        Bagertz_Data = BZ.data
+
+        if table.getn(dropped) == 0 then
+            BZ.Say("nothing stale - every character came from the folder.")
+        else
+            table.sort(dropped)
+            BZ.Say("dropped " .. table.concat(dropped, ", ") ..
+                " - left over from the old sync, with no file in the folder. " ..
+                "Each comes back once you log it in.")
+        end
+
     elseif cmd == "clear" then
         BZ.data = {}
         Bagertz_Data = BZ.data
         BZ.UpdateOwnData()
-        BZ.Say("cleared every cached character.")
+        -- Straight back out of the folder, so "cleared" does not look like
+        -- "broke it" for the twenty seconds until the next read.
+        local n = BZ.ReadOthers()
+        BZ.Say("cleared the cache. " .. n .. " character(s) came straight back " ..
+            "from the folder; anything that did not had no file.")
 
     elseif cmd == "zero" then
         if string.lower(words[2] or "") == "off" then
@@ -664,7 +693,7 @@ SlashCmdList["BAGERTZ"] = function(msg)
         end
 
     else
-        BZ.Say("usage: /bz, /bz read, /bz account <name>, /bz zero on|off,")
+        BZ.Say("usage: /bz, /bz read, /bz stale, /bz account <name>, /bz zero on|off,")
         BZ.Say("       /bz forget <name>, /bz clear, /bz tips, /bz debug")
     end
 end

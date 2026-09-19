@@ -315,9 +315,43 @@ SlashCmdList["BAGERTZ"]("clear")
 check("clearing drops the leftover", alice.BZ.data["Ghost"], nil)
 alice.BZ.ReadOthers()
 check("and the real character comes straight back from the folder",
-    alice.BZ.data["Bob"].bags[2589], 7)
+    alice.BZ.data["Bob"] and alice.BZ.data["Bob"].bags[2589], 7)
 check("still marked as having come from it",
     alice.BZ.data["Bob"].fromFile ~= nil, true)
+
+----------------------------------------------------------------------
+-- dropping the leftovers without dropping the good data
+----------------------------------------------------------------------
+resetFolder()
+alice = newClient("Alice", ALICE_BAGS)
+bob = newClient("Bob", BOB_BAGS)
+login(alice)
+login(bob)
+activate(alice)
+alice.BZ.ReadOthers()
+
+-- What an upgrade leaves behind: a name the old sync cached, with no file.
+alice.BZ.data["Salabeard"] = { realm = "N'Zoth", time = NOW, bags = { [2589] = 50 } }
+
+SlashCmdList["BAGERTZ"]("stale")
+check("the leftover is dropped", alice.BZ.data["Salabeard"], nil)
+check("a character with a file is kept", alice.BZ.data["Bob"] ~= nil, true)
+check("with its counts untouched",
+    alice.BZ.data["Bob"] and alice.BZ.data["Bob"].bags[2589], 7)
+check("and so is this character", alice.BZ.data["Alice"] ~= nil, true)
+
+--[[ Clearing everything must not look like breaking it: what is on disk has
+     to come straight back, and only the leftovers stay gone. ]]
+alice.BZ.data["Salabeard"] = { realm = "N'Zoth", time = NOW, bags = { [2589] = 50 } }
+SlashCmdList["BAGERTZ"]("clear")
+check("clear brings the folder characters straight back",
+    alice.BZ.data["Bob"] and alice.BZ.data["Bob"].bags[2589], 7)
+check("and leaves the leftover gone", alice.BZ.data["Salabeard"], nil)
+check("this character is rescanned, not lost", alice.BZ.data["Alice"] ~= nil, true)
+
+SlashCmdList["BAGERTZ"]("stale")
+check("running it again with nothing stale is harmless",
+    alice.BZ.data["Bob"] ~= nil, true)
 
 print(string.format("\n%d checks, %d failed\n", checks, failures))
 if failures > 0 then os.exit(1) end
