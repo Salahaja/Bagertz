@@ -1,7 +1,7 @@
 ## Interface: 11200
-## Version: 1.4.0
+## Version: 2.0.0
 ## Title: Bagertz
-## Notes: Shows how many of an item your other characters are carrying - including characters on a different WoW account, by syncing between two running clients while you dual-box. Password-paired.
+## Notes: Shows how many of an item your other characters are carrying - including characters on a different WoW account, by sharing a file in CustomData between clients on the same machine. No pairing, no password.
 ## Author: You
 ## SavedVariables: Bagertz_Data, Bagertz_Config
 Bagertz.lua

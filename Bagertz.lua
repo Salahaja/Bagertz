@@ -4,85 +4,70 @@
                  in the item's tooltip - including characters on a different
                  WoW ACCOUNT, which is the part nothing else can do.
 
-    Why this exists in this shape:
+    How it crosses the account boundary:
 
-    Every inventory addon that offers "counts across your characters" is limited
-    to one account, and not by choice. SavedVariables are written per account by
-    the client, only the logged-in account's file is ever loaded, and the WoW Lua
-    sandbox has no filesystem access at all - no io, no loadfile. The TOC loader
-    won't escape Interface\ either (tested: it will follow ..\SomeOtherAddon\
-    happily, and refuses ..\..\ out of the addon tree), so an addon cannot read
-    another account's saved file by any route.
+    SavedVariables cannot. The client writes them per account, under
+    WTF/Account/<ACCOUNT>/, and only the logged-in account's file is ever
+    loaded. The account name is in the path, which is exactly why one account
+    can never see another's. The Lua sandbox has no filesystem access either -
+    no io, no loadfile - and the TOC loader refuses to escape Interface\
+    (tested: it follows ..\SomeOtherAddon\ happily and refuses ..\..\).
 
-    What an addon CAN do is talk to another running client. So that's what this
-    does: while you're dual-boxing, the two clients hand each other their bag
-    contents over addon messages, and each one caches what it receives. The
-    cross-account data therefore arrives through the game rather than the disk,
-    and lands in each account's own SavedVariables naturally. Nothing has to be
-    merged, linked, or hand-edited outside the game, and because each client only
-    ever writes its own account's file, two clients running at once can't
-    clobber each other - which a shared file on disk absolutely would.
+    CustomData/ has no account in its path. It is one folder per INSTALLATION,
+    and Nampower hands Lua WriteCustomFile/ReadCustomFile to read and write in
+    it. Two clients launched from the same install therefore share it, whatever
+    accounts they are logged into. That is the whole mechanism.
 
-    A sync hands over EVERY character on the account, not just the one logged
-    in (see BZ.OwnedCharacters). Each account keeps a roster of the characters
-    that have played on it, so when the boxes meet, each delivers its whole
-    roster on the others' behalf - your alts need never be online, or ever have
-    been dual-boxed. Characters learned FROM the other box are never relayed
-    onward, which keeps each account the sole authority on its own characters
-    and leaves no echoes to arbitrate between.
+    Each character writes ONE file of its own, Bagertz_<Character>.txt, and
+    reads everyone else's. Nothing is ever written by two clients at once, so
+    there is no contention to arbitrate - which a single shared file would have
+    had, and which is why this is not one. A roster file is appended to once per
+    login so a client knows which files exist; Lua cannot list a directory.
 
-    Pairing (see BZ.Tag): addon messages are broadcast to the whole PARTY/RAID,
-    so a shared password decides whose data you accept and who accepts yours.
-    The password itself is never transmitted - each batch carries a tag derived
-    from the password plus a per-batch nonce, and the receiver recomputes it.
+    What this replaces, and why it is gone rather than kept alongside:
 
-    IMPORTANT, and deliberately not oversold: the password gates PAIRING, not
-    confidentiality. Anyone in the channel still receives the bytes. The payload
-    is obfuscated with a keystream derived from the password (BZ.Crypt) so it
-    isn't casually readable by someone running a message logger, but vanilla is
-    Lua 5.0 with no crypto primitives and this is hand-rolled - it is
-    obfuscation, not encryption. Don't treat the channel as private.
+    This addon used to hand its bags to the other client over addon messages.
+    Those are broadcast to a whole PARTY or GUILD, so it needed a shared
+    password to decide whose data to accept, a keystream to obfuscate the
+    payload from everyone else in the channel, chunking to fit 255 bytes,
+    beacons to find a paired box, and a roster negotiation to deliver alts who
+    were not online. None of that was the feature. All of it existed to survive
+    a hostile channel, and cost four hundred lines and a setup step that had to
+    be performed identically on both boxes before anything worked at all.
 
-    To limit even that exposure, the bulky inventory payload is only sent after
-    a correctly-tagged BEACON is heard from someone in the group (see
-    BZ.SendBeacon). A beacon is a few bytes and reveals only that you run this
-    addon, so sitting in a 40-man doesn't spray your bags at everyone.
+    A file on your own disk is read by nothing but the clients already running
+    on it. So: no password, no pairing, no obfuscation, no grouping requirement.
+    And because the data is on disk rather than in flight, a character does not
+    have to be online to be counted - the file it wrote last Tuesday is still
+    there, which addon messages could never do.
+
+    The trade, stated plainly: this works between clients on ONE machine. It
+    cannot share with a friend on another PC, which the old channel could.
 
     Slash commands: /bagertz (or /bz)
 --]]
 
 BZ = {}
 BZ.ADDON_NAME = "Bagertz"
-BZ.PREFIX     = "BAGERTZ"
-BZ.VERSION    = "1.4.0"
+BZ.VERSION    = "2.0.0"
 
-BZ.data   = {} -- [charName] = { realm, time, bags = { [itemID] = count } }
-BZ.config = {} -- { password = string, debug = bool }
+BZ.data   = {} -- [charName] = { realm, time, mine, bags = { [itemID] = count } }
+BZ.config = {} -- { debug = bool, showZero = bool, account = string }
 
--- Transport tuning. Vanilla drops you from the server for flooding addon
--- messages, so everything outbound goes through a queue drained on a timer
--- rather than being sent in a burst.
-BZ.MAX_PAYLOAD       = 200  -- chars of obfuscated payload per message, well under the 255 limit
-BZ.SEND_INTERVAL     = 0.4  -- seconds between outbound messages
-BZ.BEACON_INTERVAL   = 20   -- seconds between beacons while grouped
-BZ.SCAN_DEBOUNCE     = 2    -- seconds of quiet after a bag change before rescanning
-BZ.PEER_STALE_AFTER  = 60   -- seconds before a peer is considered gone
-BZ.MIN_RESEND_INTERVAL = 5  -- seconds between automatic resends after a bag change
+-- One file per character, plus a roster so they can be found. Lua cannot list
+-- a directory, so a name that never announced itself can never be read.
+BZ.ROSTER_FILE   = "Bagertz_roster.txt"
+BZ.FILE_PREFIX   = "Bagertz_"
+BZ.FILE_MAGIC    = "BAGERTZ1"
 
-BZ.sendQueue    = {}
-BZ.sendTimer    = 0
-BZ.beaconTimer  = 0
-BZ.scanTimer    = nil  -- nil = no rescan pending
-BZ.peers        = {}   -- [charName] = last time a valid beacon was heard
-BZ.incoming     = {}   -- [charName] = { nonce, chunks, expected, name }
-BZ.inventoryDirty = true
+BZ.SCAN_DEBOUNCE = 2    -- seconds of quiet after a bag change before rescanning
+BZ.READ_INTERVAL = 20   -- seconds between re-reading the other characters
+BZ.WRITE_MIN_GAP = 5    -- seconds between writes of our own file
 
--- Session counters, so "it isn't working" can be narrowed down without guessing:
--- nothing sent means we're solo or have no password; sent but nothing received
--- means the other box isn't hearing us at all; received-but-rejected means the
--- passwords differ.
-BZ.stats = { sent = 0, received = 0, rejected = 0 }
-
+BZ.scanTimer     = nil  -- nil = no rescan pending
+BZ.readTimer     = 0
+BZ.lastWrite     = nil
+BZ.fileState     = "not checked yet"
 -- ---------------------------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------------------------
@@ -98,80 +83,6 @@ end
 
 function BZ.Me()
     return UnitName("player")
-end
-
--- ---------------------------------------------------------------------------------------------
--- Password: tagging and payload obfuscation
--- ---------------------------------------------------------------------------------------------
-
--- A small string hash (FNV-1a shaped, kept inside Lua 5.0's exact-integer range
--- by folding after every step). Not a cryptographic hash and not claimed to be -
--- it exists so the password itself never goes out on the wire.
-function BZ.Hash(str)
-    local h = 2166136261
-    for i = 1, string.len(str) do
-        h = h + string.byte(str, i)
-        h = math.mod(h * 16777619, 4294967296)
-    end
-    return h
-end
-
--- The per-batch pairing tag. Both sides compute hash(password .. ":" .. nonce);
--- a listener sees only the result, which changes every batch.
-function BZ.Tag(nonce)
-    if not BZ.config.password or BZ.config.password == "" then return nil end
-    return string.format("%d", BZ.Hash(BZ.config.password .. ":" .. nonce))
-end
-
--- Rotation happens within this alphabet, which keeps the message printable and
--- exactly the same length - no base64/hex expansion eating into the 255-byte
--- budget. The keystream is a small LCG seeded from password+nonce; multiplier
--- and modulus are kept tiny so the arithmetic stays exact in Lua 5.0's doubles.
---
--- Letters are in here because the payload now carries CHARACTER NAMES (a sync
--- sends every character on the account, not just the one logged in). Without
--- them, Crypt would pass names through untouched and your alts' names would sit
--- in plaintext in the middle of an otherwise obfuscated message. '~' is
--- deliberately absent: it separates fields outside the payload and must survive
--- unchanged.
---
--- Anything not in this alphabet passes through as-is, so an unexpected
--- character still round-trips correctly rather than corrupting.
---
--- Again: this is obfuscation. It stops casual reading, nothing more.
-BZ.ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ:,;=!"
-BZ.ALPHABET_LEN = string.len(BZ.ALPHABET)
-
--- Deliberately contains every character class the wire format relies on, so
--- /bz selftest proves whether the channel delivers them unaltered. The pipe is
--- in here on purpose: it is WoW's escape character for |c / |r / |H, which is
--- exactly why the delimiter is a tilde and not a pipe.
-BZ.CANARY = "1234567890:,~and|pipe"
-
-function BZ.Crypt(text, nonce, decrypt)
-    if not BZ.config.password or BZ.config.password == "" then return text end
-
-    local k = math.mod(BZ.Hash(BZ.config.password .. "|" .. nonce), 65537)
-    local out = ""
-    for i = 1, string.len(text) do
-        local c = string.sub(text, i, i)
-        local idx = string.find(BZ.ALPHABET, c, 1, true)
-        k = math.mod(k * 75 + 74, 65537)
-        if idx then
-            local shift = math.mod(k, BZ.ALPHABET_LEN)
-            local newIdx
-            if decrypt then
-                newIdx = math.mod(idx - 1 - shift + BZ.ALPHABET_LEN * 2, BZ.ALPHABET_LEN) + 1
-            else
-                newIdx = math.mod(idx - 1 + shift, BZ.ALPHABET_LEN) + 1
-            end
-            out = out .. string.sub(BZ.ALPHABET, newIdx, newIdx)
-        else
-            -- Not a payload character; pass it through rather than corrupting it.
-            out = out .. c
-        end
-    end
-    return out
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -223,11 +134,8 @@ function BZ.UpdateOwnData()
     local entry = BZ.data[me] or {}
     entry.realm = GetRealmName()
     entry.time  = time()
-    -- Marks this character as belonging to THIS account, which is what makes a
-    -- sync able to send every character on the account rather than only the one
-    -- logged in. Characters learned from the other box never get this flag, so
-    -- they're never relayed back - each account is the sole authority on its own
-    -- characters, and there are no echoes to arbitrate between.
+    -- This character is ours to write. Everyone read out of the shared folder
+    -- is somebody else's file and is never rewritten by us.
     entry.mine  = true
     entry.bags  = BZ.ScanBags()
     if BZ.atBank then
@@ -237,347 +145,162 @@ function BZ.UpdateOwnData()
 
     BZ.data[me] = entry
     Bagertz_Data = BZ.data
-    BZ.inventoryDirty = true
     BZ.Debug("rescanned own bags")
+
+    --[[ Straight to disk. Rate-limited because rearranging your bags fires
+         BAG_UPDATE repeatedly, and rewriting the file per move is work nobody
+         asked for -- but never skipped entirely, or the last change before you
+         log out is the one that never lands. ]]
+    if not BZ.lastWrite or (time() - BZ.lastWrite) >= BZ.WRITE_MIN_GAP then
+        BZ.WriteOwn()
+    else
+        BZ.writePending = true
+    end
 end
 
 -- ---------------------------------------------------------------------------------------------
--- Wire format
+-- The shared folder
 -- ---------------------------------------------------------------------------------------------
 
--- "id:count,id:count,..." - deliberately restricted to BZ.ALPHABET so BZ.Crypt
--- can rotate within it without changing the length.
-function BZ.Serialize(counts)
-    local parts = {}
-    for id, count in pairs(counts or {}) do
-        table.insert(parts, id .. ":" .. count)
+function BZ.FileAPI()
+    return (WriteCustomFile ~= nil) and (ReadCustomFile ~= nil)
+end
+
+function BZ.FileFor(name)
+    return BZ.FILE_PREFIX .. name .. ".txt"
+end
+
+local function readFile(name)
+    if not BZ.FileAPI() then return nil end
+    local ok, text = pcall(ReadCustomFile, name)
+    if not ok then return nil end
+    return text
+end
+
+local function writeFile(name, text, mode)
+    if not BZ.FileAPI() then return false end
+    local ok = pcall(WriteCustomFile, name, text, mode or "w")
+    return ok and true or false
+end
+
+--[[ Line-oriented and one field per line, so a file written by a newer version
+     degrades to "some lines I did not recognise" rather than failing to parse.
+
+       BAGERTZ1
+       M~name~realm~time~bankTime
+       B~itemId~count      (bags)
+       K~itemId~count      (bank)
+]]
+function BZ.Serialize(name, entry)
+    local out = { BZ.FILE_MAGIC }
+    table.insert(out, "M~" .. name .. "~" .. (entry.realm or "") .. "~" ..
+        (entry.time or 0) .. "~" .. (entry.bankTime or 0))
+    for id, count in pairs(entry.bags or {}) do
+        table.insert(out, "B~" .. id .. "~" .. count)
     end
-    return table.concat(parts, ",")
-end
-
-function BZ.Deserialize(str)
-    local counts = {}
-    for pair in string.gfind(str or "", "[^,]+") do
-        local _, _, id, count = string.find(pair, "(%d+):(%d+)")
-        if id then counts[tonumber(id)] = tonumber(count) end
+    for id, count in pairs(entry.bank or {}) do
+        table.insert(out, "K~" .. id .. "~" .. count)
     end
-    return counts
+    return table.concat(out, "\n") .. "\n"
 end
 
--- One character: "Name=<bags>;<bank>", where each half is "id:count,id:count".
--- Several characters: blocks joined with "!". Every separator is part of
--- BZ.ALPHABET so it's rotated along with the data rather than standing out as
--- plaintext structure in an otherwise obfuscated payload.
-function BZ.SerializeEntry(name, entry)
-    return name .. "=" .. BZ.Serialize(entry.bags) .. ";" .. BZ.Serialize(entry.bank)
-end
+function BZ.Deserialize(text)
+    if not text or text == "" then return nil end
+    local entry, name = { bags = {}, bank = {} }, nil
 
-function BZ.SerializePayload(names)
-    local blocks = {}
-    for _, name in ipairs(names) do
-        local entry = BZ.data[name]
-        if entry then table.insert(blocks, BZ.SerializeEntry(name, entry)) end
-    end
-    return table.concat(blocks, "!")
-end
-
--- Returns a list of { name, bags, bank }.
-function BZ.DeserializePayload(str)
-    local characters = {}
-    for block in string.gfind(str or "", "[^!]+") do
-        local _, _, name, bags, bank = string.find(block, "^([^=]+)=([^;]*);(.*)$")
-        if name then
-            table.insert(characters, {
-                name = name,
-                bags = BZ.Deserialize(bags),
-                bank = BZ.Deserialize(bank),
-            })
+    for line in string.gfind(text, "[^\n]+") do
+        local _, _, kind, a, b, c, d = string.find(line, "^(%a)~([^~]*)~?([^~]*)~?([^~]*)~?([^~]*)$")
+        if kind == "M" then
+            name = a
+            entry.realm = b
+            entry.time = tonumber(c) or 0
+            entry.bankTime = tonumber(d) or 0
+        elseif kind == "B" then
+            local id, n = tonumber(a), tonumber(b)
+            if id and n then entry.bags[id] = n end
+        elseif kind == "K" then
+            local id, n = tonumber(a), tonumber(b)
+            if id and n then entry.bank[id] = n end
         end
     end
-    return characters
+
+    if not name or name == "" then return nil end
+    return name, entry
 end
 
--- Every channel we could currently reach a paired box on, narrowest first.
--- GUILD is included so the two boxes can find each other without being grouped,
--- but it is deliberately LAST: a party is two people, a guild can be hundreds,
--- and the inventory should go out over the smallest audience that reaches the
--- other box (see BZ.ChannelsForPeers).
-function BZ.Channels()
-    local channels = {}
-    if GetNumRaidMembers() > 0 then
-        table.insert(channels, "RAID")
-    elseif GetNumPartyMembers() > 0 then
-        table.insert(channels, "PARTY")
+--[[ Announce this character once per session so other clients know the file
+     exists. Appended rather than rewritten: several clients may be starting at
+     the same moment, and an append of one short line is the only write here
+     that more than one process can be doing at once. ]]
+function BZ.JoinRoster()
+    local me = BZ.Me()
+    if not me or not BZ.FileAPI() then return end
+    for _, name in ipairs(BZ.RosterNames()) do
+        if name == me then return end
     end
-    if BZ.config.useGuild ~= false and IsInGuild and IsInGuild() then
-        table.insert(channels, "GUILD")
-    end
-    return channels
+    writeFile(BZ.ROSTER_FILE, "R~" .. me .. "\n", "a")
 end
 
-function BZ.Channel()
-    local channels = BZ.Channels()
-    return channels[1]
-end
-
--- The channels a currently-known paired box was actually heard on. The bulky
--- inventory goes only to these, so being in a big guild doesn't mean every
--- sync sprays the whole guild - once your other box has been heard in the
--- party, that's where the data goes.
-function BZ.ChannelsForPeers()
-    local seen, channels = {}, {}
-    for _, peer in pairs(BZ.peers) do
-        local c = peer.channel
-        if c and not seen[c] then
-            seen[c] = true
-            table.insert(channels, c)
+function BZ.RosterNames()
+    local names, seen = {}, {}
+    for line in string.gfind(readFile(BZ.ROSTER_FILE) or "", "[^\n]+") do
+        local _, _, name = string.find(line, "^R~(.+)$")
+        if name and name ~= "" and not seen[name] then
+            seen[name] = true
+            table.insert(names, name)
         end
     end
-    return channels
-end
-
-function BZ.Queue(msg, channel)
-    table.insert(BZ.sendQueue, { msg = msg, channel = channel })
-end
-
-function BZ.DrainQueue()
-    local item = table.remove(BZ.sendQueue, 1)
-    if not item then return end
-    pcall(SendAddonMessage, BZ.PREFIX, item.msg, item.channel)
-    BZ.stats.sent = BZ.stats.sent + 1
-    BZ.Debug("sent [" .. item.channel .. "]: " .. string.sub(item.msg, 1, 60))
-end
-
--- A beacon says "I'm here and I know the password" in a few bytes. The full
--- inventory only follows once we've heard one, so the bulky payload never goes
--- out to a group that has no paired box in it.
-function BZ.SendBeacon()
-    local nonce = math.random(100000, 999999)
-    local tag = BZ.Tag(nonce)
-    if not tag then return end
-    -- Beacons go out on every reachable channel, since that's how the two boxes
-    -- find each other in the first place. They're a few bytes and say only
-    -- "someone here runs this addon".
-    local channels = BZ.Channels()
-    for _, channel in ipairs(channels) do
-        BZ.Queue("B~" .. nonce .. "~" .. tag .. "~" .. BZ.Me(), channel)
-    end
-end
-
--- Every character that has logged in on this account, most recently seen first
--- so a partial transfer still delivers the ones you're likeliest to care about.
-function BZ.OwnedCharacters()
-    local names = {}
-    for name, entry in pairs(BZ.data) do
-        if entry.mine then table.insert(names, name) end
-    end
-    table.sort(names, function(a, b)
-        return (BZ.data[a].time or 0) > (BZ.data[b].time or 0)
-    end)
     return names
 end
 
--- scope "all" sends every character on this account; anything else sends only
--- the one logged in.
---
--- The two exist because they answer different needs. Meeting the other box, or
--- asking for a sync, should hand over the whole roster - that's the entire
--- point, since the other characters aren't online to speak for themselves. But
--- a bag change only ever concerns the character who made it, and re-sending
--- five characters' inventories every time you loot something would be pure
--- waste.
-function BZ.SendInventory(scope)
-    local password = BZ.config.password
-    if not password or password == "" then
-        BZ.Debug("no password set - refusing to send")
-        return
-    end
-
-    -- Only to channels where a paired box has actually been heard. No peers
-    -- means nothing to say, which is what keeps a big guild from receiving
-    -- every sync.
-    local channels = BZ.ChannelsForPeers()
-    if table.getn(channels) == 0 then
-        BZ.Debug("no paired box heard yet - holding the inventory back")
-        return
-    end
-
+--- Write this character's own file. Nothing else ever writes it.
+function BZ.WriteOwn()
     local me = BZ.Me()
-    local names
-    if scope == "all" then
-        names = BZ.OwnedCharacters()
-    elseif BZ.data[me] then
-        names = { me }
-    else
-        names = {}
+    local entry = me and BZ.data[me]
+    if not entry then return false end
+    if not BZ.FileAPI() then
+        BZ.fileState = "no file API"
+        return false
     end
-    if table.getn(names) == 0 then return end
-
-    local nonce = math.random(100000, 999999)
-    -- Resolve the tag before building anything. Without this the no-password
-    -- case still refused to send, but only because concatenating a nil tag into
-    -- the header threw - fail-closed by accident, and a script error in the
-    -- player's face rather than a silent, intended no-op.
-    local tag = BZ.Tag(nonce)
-    if not tag then return end
-
-    local payload = BZ.Crypt(BZ.SerializePayload(names), nonce, false)
-
-    local total = math.ceil(string.len(payload) / BZ.MAX_PAYLOAD)
-    if total < 1 then total = 1 end
-
-    for _, channel in ipairs(channels) do
-        -- The "2" is the wire format version. A client that doesn't recognise it
-        -- ignores the whole transfer rather than half-parsing a format it
-        -- doesn't understand and storing nonsense.
-        BZ.Queue("H~2~" .. nonce .. "~" .. tag .. "~" ..
-            (BZ.config.account or "") .. "~" .. total, channel)
-        for i = 1, total do
-            local from = (i - 1) * BZ.MAX_PAYLOAD + 1
-            BZ.Queue("D~" .. nonce .. "~" .. i .. "~" ..
-                string.sub(payload, from, from + BZ.MAX_PAYLOAD - 1), channel)
-        end
+    if writeFile(BZ.FileFor(me), BZ.Serialize(me, entry)) then
+        BZ.lastWrite = time()
+        return true
     end
-    BZ.inventoryDirty = false
-    BZ.lastInventorySend = time()
-    BZ.Debug("queued " .. table.getn(names) .. " character(s) in " .. total .. " chunk(s), " ..
-        string.len(payload) .. " chars, to " .. table.concat(channels, "+"))
+    BZ.fileState = "write failed"
+    return false
 end
 
--- ---------------------------------------------------------------------------------------------
--- Receiving
--- ---------------------------------------------------------------------------------------------
-function BZ.OnAddonMessage(msg, sender)
-    if sender == BZ.Me() then return end
-    BZ.stats.received = BZ.stats.received + 1
-    BZ.Debug("recv from " .. tostring(sender) .. ": " .. string.sub(msg, 1, 60))
+--[[ Read every other character's file.
 
-    local _, _, kind, rest = string.find(msg, "^(%a)~(.+)$")
-    if not kind then
-        -- Arrived but unparseable. Worth surfacing rather than dropping: it's
-        -- what a transport that mangles the delimiter looks like from here.
-        BZ.stats.rejected = BZ.stats.rejected + 1
-        BZ.Debug("  could not parse that message - delimiter may have been altered in transit")
-        return
+     `mine` is never set on what comes back, because a file is only ever
+     authored by the character it describes -- so the account that wrote it is
+     the authority on it, and this client has no business claiming otherwise.
+
+     Our own file is skipped: the copy in memory is newer than anything on
+     disk by definition, and re-reading it would replace a live scan with a
+     snapshot from up to five seconds ago. ]]
+function BZ.ReadOthers()
+    if not BZ.FileAPI() then
+        BZ.fileState = "no file API - this needs Nampower"
+        return 0
     end
 
-    -- Canary: echoes exactly what arrived so a mangled transport is visible.
-    -- Debug-gated so a stranger can't print into your chat frame at will.
-    if kind == "T" then
-        if BZ.config.debug then
-            BZ.Say("selftest from " .. tostring(sender) .. " arrived as: |cFFFFFFFF" .. rest .. "|r")
-            BZ.Say("  it was sent as: |cFFFFFFFF" .. BZ.CANARY .. "|r")
-            if rest == BZ.CANARY then
-                BZ.Say("  |cFF00FF7Fidentical - the channel passes our characters through intact.|r")
-            else
-                BZ.Say("  |cFFFF5179ALTERED IN TRANSIT|r - that's the bug.")
+    local me, found = BZ.Me(), 0
+    for _, name in ipairs(BZ.RosterNames()) do
+        if name ~= me then
+            local parsed, entry = BZ.Deserialize(readFile(BZ.FileFor(name)))
+            if parsed then
+                entry.mine = false
+                BZ.data[parsed] = entry
+                found = found + 1
             end
         end
-        return
     end
 
-    if not BZ.config.password or BZ.config.password == "" then return end
-
-    if kind == "B" then
-        local _, _, nonce, tag, name = string.find(rest, "^(%d+)~(%d+)~(.+)$")
-        if not nonce then return end
-        if tag ~= BZ.Tag(nonce) then
-            BZ.stats.rejected = BZ.stats.rejected + 1
-            BZ.Debug("beacon from " .. tostring(name) .. " failed the password check - ignored")
-            return
-        end
-        local firstSeen = not BZ.peers[name]
-        -- Remember WHERE we heard them, so the inventory goes back over the same
-        -- channel rather than every channel we happen to be on.
-        BZ.peers[name] = { time = time(), channel = channel or BZ.Channel() }
-        BZ.Debug("paired beacon from " .. name)
-        -- Someone we trust is here: send ours, but only if it's changed since
-        -- last time or we've never met them.
-        -- Meeting a box for the first time hands over the WHOLE roster: the
-        -- other characters aren't online to speak for themselves, and that is
-        -- the entire reason the account keeps a list of them.
-        if firstSeen then
-            BZ.SendInventory("all")
-        elseif BZ.inventoryDirty then
-            BZ.SendInventory()
-        end
-
-    elseif kind == "H" then
-        local _, _, version, nonce, tag, account, total =
-            string.find(rest, "^(%d+)~(%d+)~(%d+)~([^~]*)~(%d+)$")
-        if not nonce then return end
-        if version ~= "2" then
-            BZ.stats.rejected = BZ.stats.rejected + 1
-            BZ.Debug("wire format v" .. tostring(version) .. " from " .. tostring(sender) ..
-                " - update both boxes to the same version")
-            return
-        end
-        if tag ~= BZ.Tag(nonce) then
-            BZ.stats.rejected = BZ.stats.rejected + 1
-            BZ.Debug("header from " .. tostring(sender) .. " failed the password check - ignored")
-            return
-        end
-        BZ.incoming[sender] = {
-            nonce = nonce, account = account,
-            expected = tonumber(total), chunks = {},
-        }
-        BZ.Debug("incoming transfer from " .. tostring(sender) .. " (" .. total .. " chunks)")
-
-    elseif kind == "D" then
-        local _, _, nonce, index, data = string.find(rest, "^(%d+)~(%d+)~(.*)$")
-        if not nonce then return end
-        local pending = BZ.incoming[sender]
-        -- The nonce ties chunks to the header that was already password-checked,
-        -- so unpaired senders can't inject data into a transfer.
-        if not pending or pending.nonce ~= nonce then return end
-
-        pending.chunks[tonumber(index)] = data or ""
-
-        local have = 0
-        for _ in pairs(pending.chunks) do have = have + 1 end
-        if have < pending.expected then return end
-
-        local joined = ""
-        for i = 1, pending.expected do
-            joined = joined .. (pending.chunks[i] or "")
-        end
-        local characters = BZ.DeserializePayload(BZ.Crypt(joined, pending.nonce, true))
-        local updated = {}
-
-        for _, incoming in ipairs(characters) do
-            local nBank = 0
-            for _ in pairs(incoming.bank or {}) do nBank = nBank + 1 end
-
-            local entry = BZ.data[incoming.name] or {}
-            entry.realm   = GetRealmName()
-            entry.time    = time()
-            entry.account = (pending.account ~= "" and pending.account) or entry.account
-            entry.bags    = incoming.bags
-            -- Never flagged mine: a character learned from the other box belongs
-            -- to that account, and relaying it back would create an echo whose
-            -- staleness we'd then have to arbitrate against the original.
-            entry.mine    = nil
-            -- Only replace a known bank with a non-empty one: the sender may not
-            -- have visited a bank yet, and an empty section shouldn't erase what
-            -- we already had.
-            if nBank > 0 then
-                entry.bank = incoming.bank
-                entry.bankTime = time()
-            end
-
-            BZ.data[incoming.name] = entry
-            table.insert(updated, BZ.DisplayName(incoming.name))
-        end
-
-        Bagertz_Data = BZ.data
-        BZ.incoming[sender] = nil
-        if table.getn(updated) > 0 then
-            BZ.Say("updated " .. table.getn(updated) .. " character(s): " ..
-                table.concat(updated, ", "))
-        end
-    end
+    Bagertz_Data = BZ.data
+    BZ.fileState = found .. " character file(s) read"
+    return found
 end
-
 -- ---------------------------------------------------------------------------------------------
 -- Tooltips
 -- ---------------------------------------------------------------------------------------------
@@ -800,41 +523,13 @@ SlashCmdList["BAGERTZ"] = function(msg)
     for word in string.gfind(msg or "", "[^%s]+") do table.insert(words, word) end
     local cmd = string.lower(words[1] or "")
 
-    if cmd == "password" then
-        if not words[2] then
-            if BZ.config.password and BZ.config.password ~= "" then
-                -- Never print the password back: this prints in a chat frame that
-                -- may be logged or streamed.
-                BZ.Say("a password is set. Use |cFFFFFFFF/bz password <word>|r to change it, " ..
-                    "|cFFFFFFFF/bz password off|r to stop sharing.")
-            else
-                BZ.Say("|cFFFF5179no password set|r - nothing is shared until there is one. " ..
-                    "Use |cFFFFFFFF/bz password <word>|r, and set the SAME word on your other box.")
-            end
-        elseif string.lower(words[2]) == "off" then
-            BZ.config.password = nil
-            Bagertz_Config = BZ.config
-            BZ.peers = {}
-            BZ.Say("password cleared - sharing is off.")
-        else
-            BZ.config.password = words[2]
-            Bagertz_Config = BZ.config
-            BZ.peers = {}
-            BZ.inventoryDirty = true
-            BZ.Say("password set. Set the same word on your other box, group the two " ..
-                "characters together, and they'll find each other.")
-        end
-
-    elseif cmd == "sync" then
-        if not BZ.Channel() then
-            BZ.Say("you're not in a party or raid - there's nobody to sync with.")
-        else
-            BZ.UpdateOwnData()
-            BZ.SendBeacon()
-            BZ.SendInventory("all")
-            BZ.Say("syncing " .. table.getn(BZ.OwnedCharacters()) ..
-                " character(s) from this account...")
-        end
+    if cmd == "read" or cmd == "sync" then
+        -- "sync" kept as a word people will reach for out of habit; there is
+        -- nothing to synchronise any more, only a folder to re-read.
+        BZ.JoinRoster()
+        BZ.UpdateOwnData()
+        local n = BZ.ReadOthers()
+        BZ.Say("re-read the shared folder: " .. n .. " other character(s).")
 
     elseif cmd == "forget" and words[2] then
         local target
@@ -897,67 +592,31 @@ SlashCmdList["BAGERTZ"] = function(msg)
             local label = string.gsub(words[2], "~", "-")
             BZ.config.account = label
             Bagertz_Config = BZ.config
-            BZ.inventoryDirty = true
+            BZ.WriteOwn()
             BZ.Say("this account is now labelled |cFF00FF7F" .. label .. "|r.")
-        end
-
-    elseif cmd == "guild" then
-        if string.lower(words[2] or "") == "off" then
-            BZ.config.useGuild = false
-            Bagertz_Config = BZ.config
-            BZ.Say("guild channel off - the boxes will only find each other while grouped.")
-        else
-            BZ.config.useGuild = true
-            Bagertz_Config = BZ.config
-            BZ.Say("guild channel on - the boxes can find each other without being grouped, " ..
-                "as long as both are in a guild. Inventory still only goes to a box that " ..
-                "answered with the right password.")
-        end
-
-    elseif cmd == "selftest" then
-        if not BZ.Channel() then
-            BZ.Say("you're not in a party or raid - nothing to send a test through.")
-        elseif not BZ.config.debug then
-            BZ.Say("turn on |cFFFFFFFF/bz debug|r on BOTH boxes first, then run this again " ..
-                "(the echo only prints in debug, so strangers can't spam your chat).")
-        else
-            BZ.Queue("T~" .. BZ.CANARY)
-            BZ.Say("canary sent. The other box will print what actually arrived.")
         end
 
     elseif cmd == "" then
         local me = BZ.Me()
 
-        -- Status first: this is the part that turns "it isn't working" into a
-        -- specific answer.
-        local channel = BZ.Channel()
-        BZ.Say("password: " .. ((BZ.config.password and BZ.config.password ~= "")
-            and "|cFF00FF7Fset|r" or "|cFFFF5179NOT SET|r - nothing will be shared"))
-        local reachable = BZ.Channels()
-        BZ.Say("channels: " .. (table.getn(reachable) > 0
-            and ("|cFF00FF7F" .. table.concat(reachable, ", ") .. "|r")
-            or "|cFFFF5179none|r - not grouped and not in a guild, so nothing can be sent"))
+        --[[ Status first, and it is a much shorter story than it used to be.
+             There is no pairing to be half-done any more: either the folder
+             can be read or it cannot, and either other characters have written
+             to it or they have not. ]]
+        if not BZ.FileAPI() then
+            BZ.Say("|cFFFF5179Nampower's file API is missing|r - nothing can be " ..
+                "shared. In OctoLauncher: Mods -> Nampower.")
+        else
+            BZ.Say("shared folder: |cFF00FF7FCustomData|r, " .. BZ.fileState)
+            BZ.Say("my file: " .. BZ.FileFor(me or "?") ..
+                (BZ.lastWrite and (" |cFF888888(written " ..
+                    math.floor((time() - BZ.lastWrite)) .. "s ago)|r") or
+                 " |cFFFF5179(not written yet)|r"))
+        end
+
         BZ.Say("account label: " .. ((BZ.config.account and BZ.config.account ~= "")
             and ("|cFF00FF7F" .. BZ.config.account .. "|r")
             or "|cFF888888none (optional - /bz account <name>)|r"))
-
-        local peerNames = {}
-        for name in pairs(BZ.peers) do table.insert(peerNames, name) end
-        if table.getn(peerNames) > 0 then
-            BZ.Say("paired boxes heard: |cFF00FF7F" .. table.concat(peerNames, ", ") .. "|r")
-        else
-            BZ.Say("paired boxes heard: |cFFFF5179none|r")
-        end
-
-        BZ.Say("this session - sent " .. BZ.stats.sent .. ", received " .. BZ.stats.received ..
-            ", rejected " .. BZ.stats.rejected)
-        if BZ.stats.sent > 0 and BZ.stats.received == 0 then
-            BZ.Say("  |cFFFF5179sending but hearing nothing|r - the other box isn't receiving, " ..
-                "or isn't running this addon.")
-        elseif BZ.stats.rejected > 0 and BZ.stats.rejected == BZ.stats.received then
-            BZ.Say("  |cFFFF5179everything received was rejected|r - the passwords differ, " ..
-                "or the message was altered in transit (try |cFFFFFFFF/bz selftest|r).")
-        end
 
         local names = {}
         for name in pairs(BZ.data) do table.insert(names, name) end
@@ -970,41 +629,38 @@ SlashCmdList["BAGERTZ"] = function(msg)
             local age = entry.time and math.floor((time() - entry.time) / 60) or nil
             local label
             if name == me then
-                label = "|cFF00FF7F" .. BZ.DisplayName(name) .. " (you)|r"
+                label = BZ.DisplayName(name) .. " |cFF888888(this character)|r"
             elseif entry.mine then
-                -- On this account, so we send it to the other box on their behalf
-                -- even while they're offline.
+                -- Written by us on an earlier login; still ours to rewrite.
                 label = BZ.DisplayName(name) .. " |cFF888888(this account)|r"
             else
-                label = BZ.DisplayName(name) .. " |cFF888888(learned)|r"
+                label = BZ.DisplayName(name) .. " |cFF888888(from the folder)|r"
             end
             BZ.Say("  " .. label ..
                 " - " .. types .. " item types" ..
                 (age and (", updated " .. age .. "m ago") or ""))
         end
-        if not BZ.config.password or BZ.config.password == "" then
-            BZ.Say("|cFFFF5179no password set|r - use |cFFFFFFFF/bz password <word>|r on both boxes.")
+        if table.getn(names) <= 1 then
+            BZ.Say("|cFF888888Only this character so far. Log another one in " ..
+                "from this same install and it will appear.|r")
         end
 
     else
-        BZ.Say("usage: /bz, /bz account <name>, /bz password <word>, /bz password off,")
-        BZ.Say("       /bz guild on|off, /bz sync, /bz selftest, /bz forget <name>, /bz clear, /bz debug")
+        BZ.Say("usage: /bz, /bz read, /bz account <name>, /bz zero on|off,")
+        BZ.Say("       /bz forget <name>, /bz clear, /bz tips, /bz debug")
     end
 end
-
 -- ---------------------------------------------------------------------------------------------
 -- Events
 -- ---------------------------------------------------------------------------------------------
 local ev = CreateFrame("Frame")
 ev:RegisterEvent("ADDON_LOADED")
 ev:RegisterEvent("PLAYER_ENTERING_WORLD")
+ev:RegisterEvent("PLAYER_LOGOUT")
 ev:RegisterEvent("BAG_UPDATE")
 ev:RegisterEvent("BANKFRAME_OPENED")
 ev:RegisterEvent("BANKFRAME_CLOSED")
 ev:RegisterEvent("PLAYERBANKSLOTS_CHANGED")
-ev:RegisterEvent("PARTY_MEMBERS_CHANGED")
-ev:RegisterEvent("RAID_ROSTER_UPDATE")
-ev:RegisterEvent("CHAT_MSG_ADDON")
 
 ev:SetScript("OnEvent", function()
     if event == "ADDON_LOADED" then
@@ -1012,16 +668,22 @@ ev:SetScript("OnEvent", function()
         BZ.data = Bagertz_Data or {}
         BZ.config = Bagertz_Config or {}
         BZ.HookTooltips()
-        if not BZ.config.password or BZ.config.password == "" then
-            BZ.Say("loaded. |cFFFF5179No password set|r - nothing is shared yet. " ..
-                "Run |cFFFFFFFF/bz password <word>|r here and on your other box.")
+
+        if not BZ.FileAPI() then
+            BZ.Say("|cFFFF5179Nampower's file API is missing|r, so other " ..
+                "characters cannot be read. In OctoLauncher: Mods -> Nampower.")
         end
 
-    elseif event == "CHAT_MSG_ADDON" then
-        -- arg1=prefix, arg2=message, arg3=channel, arg4=sender
-        if arg1 == BZ.PREFIX then
-            BZ.OnAddonMessage(arg2, arg4)
-        end
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        BZ.JoinRoster()
+        BZ.UpdateOwnData()
+        BZ.ReadOthers()
+
+    elseif event == "PLAYER_LOGOUT" then
+        --[[ The last word. Everything since the previous write is only in
+             memory, and memory is exactly what logging out discards -- while
+             the other client is still running and about to read this file. ]]
+        BZ.WriteOwn()
 
     elseif event == "BAG_UPDATE" or event == "PLAYERBANKSLOTS_CHANGED" then
         -- Debounced: looting a stack fires this several times in a row, and
@@ -1038,12 +700,6 @@ ev:SetScript("OnEvent", function()
         -- read as an empty bank.
         BZ.UpdateOwnData()
         BZ.atBank = false
-
-    elseif event == "PLAYER_ENTERING_WORLD" then
-        BZ.UpdateOwnData()
-
-    else -- group changed
-        BZ.beaconTimer = BZ.BEACON_INTERVAL -- beacon on the next tick
     end
 end)
 
@@ -1055,31 +711,22 @@ ev:SetScript("OnUpdate", function()
         if BZ.scanTimer <= 0 then
             BZ.scanTimer = nil
             BZ.UpdateOwnData()
-            -- Push the change straight out rather than waiting for the other
-            -- box's next beacon, which could be 20s away. Rate-limited so
-            -- rearranging your bags doesn't turn into a broadcast per move.
-            if BZ.inventoryDirty and table.getn(BZ.ChannelsForPeers()) > 0 then
-                if not BZ.lastInventorySend or (time() - BZ.lastInventorySend) >= BZ.MIN_RESEND_INTERVAL then
-                    BZ.SendInventory()
-                end
-            end
         end
     end
 
-    BZ.sendTimer = BZ.sendTimer + elapsed
-    if BZ.sendTimer >= BZ.SEND_INTERVAL then
-        BZ.sendTimer = 0
-        BZ.DrainQueue()
+    -- A write held back by the rate limit still has to happen.
+    if BZ.writePending and
+       (not BZ.lastWrite or (time() - BZ.lastWrite) >= BZ.WRITE_MIN_GAP) then
+        BZ.writePending = nil
+        BZ.WriteOwn()
     end
 
-    BZ.beaconTimer = BZ.beaconTimer + elapsed
-    if BZ.beaconTimer >= BZ.BEACON_INTERVAL then
-        BZ.beaconTimer = 0
-        BZ.SendBeacon()
-        -- Drop peers we haven't heard from in a while so a departed box stops
-        -- counting as present.
-        for name, seen in pairs(BZ.peers) do
-            if (time() - (seen.time or 0)) > BZ.PEER_STALE_AFTER then BZ.peers[name] = nil end
-        end
+    --[[ The other characters are re-read on a timer rather than watched,
+         because there is nothing to watch: a file changes without telling
+         anyone. Twenty seconds is far below how often a tooltip matters. ]]
+    BZ.readTimer = BZ.readTimer + elapsed
+    if BZ.readTimer >= BZ.READ_INTERVAL then
+        BZ.readTimer = 0
+        BZ.ReadOthers()
     end
 end)
