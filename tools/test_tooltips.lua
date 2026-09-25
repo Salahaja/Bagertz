@@ -230,6 +230,27 @@ do
 end
 
 -- ---------------------------------------------------------------------------
+print("another realm's characters stay out of the tooltip")
+do
+    boot()
+    --[[ One account's SavedVariables span every realm it plays on, so the
+         cache can hold characters whose items are nowhere near this realm. ]]
+    BZ.data["Faraway"] = {
+        realm = "Kel'Thuzad", time = os.time(), bags = { [2589] = 7 },
+    }
+    -- Cached before realms were kept: given the benefit of the doubt.
+    BZ.data["Oldtimer"] = { time = os.time(), bags = { [2589] = 3 } }
+    lines = {}
+    GameTooltip:SetBagItem(0, 1)
+    local text = table.concat(lines, "|")
+    check("another realm's holder is not listed",
+        string.find(text, "Faraway", 1, true), nil)
+    check("  this realm's still is", string.find(text, "Salabeard", 1, true) ~= nil, true)
+    check("  and so is one with no realm recorded",
+        string.find(text, "Oldtimer", 1, true) ~= nil, true)
+end
+
+-- ---------------------------------------------------------------------------
 print("hooking twice does not double the lines")
 do
     boot()

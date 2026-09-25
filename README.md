@@ -1,4 +1,4 @@
-# Bagertz (v2.0.0)
+# Bagertz (v2.0.1)
 
 Shows how many of an item your **other characters** are carrying, right in the item's tooltip — including characters on a **different WoW account**, which is the part nothing else does.
 
@@ -16,13 +16,15 @@ Every inventory addon that offers "counts across your characters" is limited to 
 
 `CustomData/` has **no account in its path**. It is one folder per *installation*, and Nampower hands Lua `WriteCustomFile` / `ReadCustomFile` to read and write in it. Two clients launched from the same install share that folder, whatever accounts they are logged into. That is the whole mechanism.
 
-Each character writes one file of its own, `Bagertz_<Character>.txt`, and reads everyone else's. Nothing is ever written by two clients at once, so there is no contention to arbitrate — which a single shared file would have had, and which is why this is not one. A roster file is appended to once per login so a client knows which files exist, since Lua cannot list a directory.
+Each character writes one file of its own, `Bagertz_<Realm>_<Character>.txt`, and reads everyone else's. Nothing is ever written by two clients at once, so there is no contention to arbitrate — which a single shared file would have had, and which is why this is not one. A roster file is appended to once per login so a client knows which files exist, since Lua cannot list a directory.
+
+The realm is in the file name because the folder belongs to the installation, not the realm: two characters called Bob on two realms get two files. Only characters on the realm you are playing are read — nothing on another realm can be reached from here anyway.
 
 ### Setup
 
 None. Log a character in and it appears. Log another in — on either account — and each sees the other.
 
-## What v2.0.0 removed, and why
+## What the folder replaced, and why
 
 Bagertz used to hand its bags to the other client over **addon messages**. Those are broadcast to a whole PARTY or GUILD, so it needed:
 
@@ -35,6 +37,8 @@ Bagertz used to hand its bags to the other client over **addon messages**. Those
 None of that was the feature. All of it existed to survive a hostile channel, and it cost ~400 lines and a setup step that had to be performed identically on both boxes before anything worked at all.
 
 A file on your own disk is read by nothing but the clients already running on it. So: **no password, no pairing, no obfuscation, no grouping requirement.** And because the data is on disk rather than in flight, a character doesn't have to be online to be counted — the file it wrote last Tuesday is still there, which addon messages could never do.
+
+That machinery survives in one place only: the opt-in link below, for the one case a folder cannot reach.
 
 ## Sharing with someone on another PC
 
@@ -69,11 +73,11 @@ where addon messages travel.
 | --- | --- |
 | `/bz` | Status: the folder, your file, and every character known |
 | `/bz read` | Re-read the folder now (also `/bz sync`) |
-| `/bz account <name>` | Label this account, shown beside its characters |
+| `/bz account <name>` | Label this account, shown beside its characters — on your other account too |
 | `/bz zero on\|off` | Whether a tooltip says so when nobody holds the item |
-| `/bz forget <name>` | Drop one cached character |
-| `/bz stale` | Drop only characters with no file behind them (post-upgrade leftovers) |
-| `/bz clear` | Drop everything cached; anything with a file returns at once |
+| `/bz forget <name>` | Drop one character, e.g. one you deleted; it stays gone unless it logs in again |
+| `/bz stale` | Drop only characters with neither a file nor a link behind them (post-upgrade leftovers) |
+| `/bz clear` | Drop this realm's cached characters; anything with a file returns at once |
 | `/bz share <character>` | Offer to link with someone on another PC |
 | `/bz sharing` | Who you are linked to, with an Unlink button |
 | `/bz unlink` | Stop sharing, and tell them |

@@ -24,7 +24,7 @@
     had, and which is why this is not one. A roster file is appended to once per
     login so a client knows which files exist; Lua cannot list a directory.
 
-    What this replaces, and why it is gone rather than kept alongside:
+    What this replaced:
 
     This addon used to hand its bags to the other client over addon messages.
     Those are broadcast to a whole PARTY or GUILD, so it needed a shared
@@ -41,15 +41,17 @@
     have to be online to be counted - the file it wrote last Tuesday is still
     there, which addon messages could never do.
 
-    The trade, stated plainly: this works between clients on ONE machine. It
-    cannot share with a friend on another PC, which the old channel could.
+    The folder only reaches clients on ONE machine. Sharing with a partner on
+    another PC is still possible, as an opt-in link over the game itself (see
+    "Linking with someone on another PC" below), and it is off - and silent -
+    until both of you agree to it.
 
     Slash commands: /bagertz (or /bz)
 --]]
 
 BZ = {}
 BZ.ADDON_NAME = "Bagertz"
-BZ.VERSION    = "2.0.0"
+BZ.VERSION    = "2.0.1"
 
 BZ.data   = {} -- [charName] = { realm, time, mine, bags = { [itemID] = count } }
 BZ.config = {} -- { debug, showZero, account, password, partner = { name, account } }
@@ -103,13 +105,27 @@ function BZ.Me()
     return UnitName("player")
 end
 
+--[[ Whether a cached character is on the realm being played. SavedVariables
+     are per account, not per realm, so the cache holds this account's
+     characters from every realm it plays on. Nothing of theirs is reachable
+     from here, so they are not shown or sent -- but they are kept, because a
+     bank is only readable at the bank and the cache is where it waits. An
+     entry with no realm predates realms being recorded, and gets the benefit
+     of the doubt. ]]
+function BZ.OnThisRealm(entry)
+    local realm = entry and entry.realm
+    return not realm or realm == "" or realm == GetRealmName()
+end
+
 -- ---------------------------------------------------------------------------------------------
 -- Password: tagging and payload obfuscation
 -- ---------------------------------------------------------------------------------------------
 
--- A small string hash (FNV-1a shaped, kept inside Lua 5.0's exact-integer range
--- by folding after every step). Not a cryptographic hash and not claimed to be -
--- it exists so the password itself never goes out on the wire.
+-- A small string hash (FNV-1a shaped, folded to 32 bits after every step). Not a
+-- cryptographic hash and not claimed to be - it exists so the password itself
+-- never goes out on the wire. In the client's doubles the multiply can pass 2^53
+-- and round, so this is not textbook FNV-1a; it is deterministic, which is all
+-- two clients agreeing on a tag needs.
 function BZ.Hash(str)
     local h = 2166136261
     for i = 1, string.len(str) do
@@ -123,7 +139,12 @@ end
 -- a listener sees only the result, which changes every batch.
 function BZ.Tag(nonce)
     if not BZ.config.password or BZ.config.password == "" then return nil end
-    return string.format("%d", BZ.Hash(BZ.config.password .. ":" .. nonce))
+    --[[ "%.0f", never "%d". The client's Lua is a 32-bit build and %d goes
+         through a C int, so every hash from 2^31 up - half of them - printed
+         as -2147483648. The receiver rightly refuses a tag that is not a plain
+         number, so half of all beacons and transfers vanished without a word.
+         %.0f prints the whole value, exactly, in every Lua. ]]
+    return string.format("%.0f", BZ.Hash(BZ.config.password .. ":" .. nonce))
 end
 
 -- Rotation happens within this alphabet, which keeps the message printable and
@@ -224,7 +245,15 @@ function BZ.UpdateOwnData()
     local me = BZ.Me()
     if not me then return end
 
-    local entry = BZ.data[me] or {}
+    local entry = BZ.data[me]
+    --[[ The cache is keyed by name alone, so it can hold nothing for this
+         character (after /bz clear) or a same-named one from another realm.
+         Either way this character's bank would be lost, or worse borrowed.
+         Its own file is the one thing only it ever writes, so that is where
+         its last bank comes back from. ]]
+    if not entry or not BZ.OnThisRealm(entry) then
+        entry = BZ.ReadOwnFile() or {}
+    end
     entry.realm = GetRealmName()
     entry.time  = time()
     -- This character is ours to write. Everyone read out of the shared folder
@@ -262,7 +291,20 @@ function BZ.FileAPI()
     return (WriteCustomFile ~= nil) and (ReadCustomFile ~= nil)
 end
 
-function BZ.FileFor(name)
+--[[ The realm is in the name as well as the character. The folder belongs to
+     the installation, not the realm, so two characters called Bob on two realms
+     would otherwise both be writing one file. ]]
+local function realmTag(realm)
+    return (string.gsub(realm or GetRealmName() or "", "[^%w]", ""))
+end
+
+function BZ.FileFor(name, realm)
+    return BZ.FILE_PREFIX .. realmTag(realm) .. "_" .. name .. ".txt"
+end
+
+--- What 2.0.0 called the same file, before the realm was in the name. Still
+--- read, until that character logs in once and writes the new one.
+function BZ.LegacyFileFor(name)
     return BZ.FILE_PREFIX .. name .. ".txt"
 end
 
@@ -284,6 +326,7 @@ end
 
        BAGERTZ1
        M~name~realm~time~bankTime
+       A~label             (the account's label, only when it has one)
        B~itemId~count      (bags)
        K~itemId~count      (bank)
 ]]
@@ -291,6 +334,11 @@ function BZ.Serialize(name, entry)
     local out = { BZ.FILE_MAGIC }
     table.insert(out, "M~" .. name .. "~" .. (entry.realm or "") .. "~" ..
         (entry.time or 0) .. "~" .. (entry.bankTime or 0))
+    -- Its own line, so a reader that predates it skips it rather than failing
+    -- to parse the M line.
+    if entry.account and entry.account ~= "" then
+        table.insert(out, "A~" .. entry.account)
+    end
     for id, count in pairs(entry.bags or {}) do
         table.insert(out, "B~" .. id .. "~" .. count)
     end
@@ -311,6 +359,8 @@ function BZ.Deserialize(text)
             entry.realm = b
             entry.time = tonumber(c) or 0
             entry.bankTime = tonumber(d) or 0
+        elseif kind == "A" then
+            if a ~= "" then entry.account = a end
         elseif kind == "B" then
             local id, n = tonumber(a), tonumber(b)
             if id and n then entry.bags[id] = n end
@@ -331,19 +381,36 @@ end
 function BZ.JoinRoster()
     local me = BZ.Me()
     if not me or not BZ.FileAPI() then return end
-    for _, name in ipairs(BZ.RosterNames()) do
-        if name == me then return end
+    local realm = GetRealmName() or ""
+    for _, r in ipairs(BZ.Roster()) do
+        if r.name == me and r.realm == realm then return end
     end
-    writeFile(BZ.ROSTER_FILE, "R~" .. me .. "\n", "a")
+    writeFile(BZ.ROSTER_FILE, "R~" .. me .. "~" .. realm .. "\n", "a")
+end
+
+--- Every announced character, as { name, realm }. A line written by 2.0.0
+--- carries no realm; for those, the file itself says which realm it is.
+function BZ.Roster()
+    local out, seen = {}, {}
+    for line in string.gfind(readFile(BZ.ROSTER_FILE) or "", "[^\n]+") do
+        local _, _, name, realm = string.find(line, "^R~([^~]+)~?(.*)$")
+        if name and name ~= "" then
+            realm = realm or ""
+            if not seen[name .. "~" .. realm] then
+                seen[name .. "~" .. realm] = true
+                table.insert(out, { name = name, realm = realm })
+            end
+        end
+    end
+    return out
 end
 
 function BZ.RosterNames()
     local names, seen = {}, {}
-    for line in string.gfind(readFile(BZ.ROSTER_FILE) or "", "[^\n]+") do
-        local _, _, name = string.find(line, "^R~(.+)$")
-        if name and name ~= "" and not seen[name] then
-            seen[name] = true
-            table.insert(names, name)
+    for _, r in ipairs(BZ.Roster()) do
+        if not seen[r.name] then
+            seen[r.name] = true
+            table.insert(names, r.name)
         end
     end
     return names
@@ -358,8 +425,15 @@ function BZ.WriteOwn()
         BZ.fileState = "no file API"
         return false
     end
+    -- The label travels in the file, or nobody else could ever show it.
+    if BZ.config.account and BZ.config.account ~= "" then
+        entry.account = BZ.config.account
+    else
+        entry.account = nil
+    end
     if writeFile(BZ.FileFor(me), BZ.Serialize(me, entry)) then
         BZ.lastWrite = time()
+        BZ.RetireLegacyFile()
         return true
     end
     BZ.fileState = "write failed"
@@ -381,27 +455,81 @@ function BZ.ReadOthers()
         return 0
     end
 
-    local me, found = BZ.Me(), 0
-    for _, name in ipairs(BZ.RosterNames()) do
-        if name ~= me then
-            local parsed, entry = BZ.Deserialize(readFile(BZ.FileFor(name)))
-            if parsed then
-                entry.mine = false
-                --[[ Stamped with WHEN it was read, so "is this actually coming
-                     from the folder, or is it left over from the version that
-                     synced over addon messages?" has an answer. Old cached
-                     characters are indistinguishable from new ones otherwise,
-                     and a wrong count that looks right is the worst kind. ]]
-                entry.fromFile = time()
-                BZ.data[parsed] = entry
-                found = found + 1
+    local me, realm, found = BZ.Me(), GetRealmName() or "", 0
+    local forgotten = BZ.config.forgotten or {}
+    local fresh = {}
+
+    for _, r in ipairs(BZ.Roster()) do
+        --[[ Another realm's characters never enter memory. Their items are out
+             of reach from here, and a character of the same name there would
+             otherwise share this one's cache slot. A 2.0.0 roster line has no
+             realm, so its file is read and the realm inside it decides. ]]
+        if r.name ~= me and (r.realm == "" or r.realm == realm) then
+            local path
+            if r.realm == "" then path = BZ.LegacyFileFor(r.name)
+            else path = BZ.FileFor(r.name, r.realm) end
+            local parsed, entry = BZ.Deserialize(readFile(path))
+            if parsed and parsed ~= me and (entry.realm or "") == realm then
+                local gone = forgotten[parsed]
+                if gone and (entry.time or 0) <= gone then
+                    -- Forgotten with /bz forget, and not logged in since.
+                elseif not fresh[parsed] or
+                       (entry.time or 0) > (fresh[parsed].time or 0) then
+                    -- A file newer than the forgetting means they logged in
+                    -- again, so they are plainly not deleted.
+                    if gone then forgotten[parsed] = nil end
+                    -- Newest wins: during the move from 2.0.0 one character
+                    -- can have a file under both names.
+                    fresh[parsed] = entry
+                end
             end
         end
+    end
+
+    for name, entry in pairs(fresh) do
+        entry.mine = false
+        --[[ Stamped with WHEN it was read, so "is this actually coming from
+             the folder, or is it left over from the version that synced over
+             addon messages?" has an answer. Old cached characters are
+             indistinguishable from new ones otherwise, and a wrong count that
+             looks right is the worst kind. ]]
+        entry.fromFile = time()
+        BZ.data[name] = entry
+        found = found + 1
     end
 
     Bagertz_Data = BZ.data
     BZ.fileState = found .. " character file(s) read"
     return found
+end
+
+--[[ The file 2.0.0 wrote under this character's bare name is this
+     character's too. Once the new one is written it is emptied, so no client
+     goes on reading a snapshot this character has moved on from. Checked
+     against the realm inside it first: under the old naming the file could
+     just as well hold a same-named character on another realm. ]]
+function BZ.RetireLegacyFile()
+    if BZ.legacyRetired then return end
+    BZ.legacyRetired = true
+    local me = BZ.Me()
+    local old = me and readFile(BZ.LegacyFileFor(me))
+    if not old or old == "" then return end
+    local oldName, oldEntry = BZ.Deserialize(old)
+    if oldName == me and (oldEntry.realm or "") == (GetRealmName() or "") then
+        writeFile(BZ.LegacyFileFor(me), "")
+    end
+end
+
+--- This character's own last snapshot on disk, under either name, or nil.
+function BZ.ReadOwnFile()
+    local me, realm = BZ.Me(), GetRealmName() or ""
+    if not me then return nil end
+    local paths = { BZ.FileFor(me), BZ.LegacyFileFor(me) }
+    for i = 1, 2 do
+        local parsed, entry = BZ.Deserialize(readFile(paths[i]))
+        if parsed == me and (entry.realm or "") == realm then return entry end
+    end
+    return nil
 end
 -- ---------------------------------------------------------------------------------------------
 -- Wire format
@@ -542,7 +670,11 @@ end
 function BZ.OwnedCharacters()
     local names = {}
     for name, entry in pairs(BZ.data) do
-        if entry.mine or entry.fromFile then table.insert(names, name) end
+        -- A partner is on this realm, or the game could not carry their
+        -- messages; another realm's characters are no use to them.
+        if (entry.mine or entry.fromFile) and BZ.OnThisRealm(entry) then
+            table.insert(names, name)
+        end
     end
     table.sort(names, function(a, b)
         return (BZ.data[a].time or 0) > (BZ.data[b].time or 0)
@@ -1161,8 +1293,11 @@ function BZ.AddTooltipLines(tooltip, itemID)
 
     local me = BZ.Me()
     local names = {}
-    for name in pairs(BZ.data) do
-        if name ~= me then table.insert(names, name) end
+    for name, entry in pairs(BZ.data) do
+        -- This realm only: nothing on another realm can be reached from here.
+        if name ~= me and BZ.OnThisRealm(entry) then
+            table.insert(names, name)
+        end
     end
     table.sort(names)
     -- Your own character first: it's the count you're most often checking
@@ -1376,7 +1511,14 @@ SlashCmdList["BAGERTZ"] = function(msg)
         if target then
             BZ.data[target] = nil
             Bagertz_Data = BZ.data
-            BZ.Say("forgot " .. target .. ".")
+            --[[ Remembered, or the next read of the folder brings them straight
+                 back: their file is still there, and Lua cannot delete it. They
+                 stay forgotten until they log in again, which is exactly what
+                 tells a deleted character from a live one. ]]
+            BZ.config.forgotten = BZ.config.forgotten or {}
+            BZ.config.forgotten[target] = time()
+            Bagertz_Config = BZ.config
+            BZ.Say("forgot " .. target .. " - they come back only if they log in again.")
         else
             BZ.Say("no cached character called \"" .. words[2] .. "\".")
         end
@@ -1392,7 +1534,14 @@ SlashCmdList["BAGERTZ"] = function(msg)
         BZ.ReadOthers()
         local me, dropped = BZ.Me(), {}
         for name, entry in pairs(BZ.data) do
-            if name ~= me and not entry.fromFile then table.insert(dropped, name) end
+            -- A linked partner's characters come over the link, not the
+            -- folder: current, not leftovers, whatever the folder says. And
+            -- another realm's are only ever read on that realm, so having no
+            -- file read here says nothing about them.
+            if name ~= me and BZ.OnThisRealm(entry) and
+               not entry.fromFile and not entry.fromChannel then
+                table.insert(dropped, name)
+            end
         end
         for _, name in ipairs(dropped) do BZ.data[name] = nil end
         Bagertz_Data = BZ.data
@@ -1407,7 +1556,14 @@ SlashCmdList["BAGERTZ"] = function(msg)
         end
 
     elseif cmd == "clear" then
-        BZ.data = {}
+        --[[ This realm's characters. Another realm's are neither shown nor
+             read here, so nothing would bring them back until you played
+             there -- and their banks not even then. ]]
+        local kept = {}
+        for name, entry in pairs(BZ.data) do
+            if not BZ.OnThisRealm(entry) then kept[name] = entry end
+        end
+        BZ.data = kept
         Bagertz_Data = BZ.data
         BZ.UpdateOwnData()
         -- Straight back out of the folder, so "cleared" does not look like
@@ -1494,8 +1650,16 @@ SlashCmdList["BAGERTZ"] = function(msg)
             and ("|cFF00FF7F" .. BZ.config.account .. "|r")
             or "|cFF888888none (optional - /bz account <name>)|r"))
 
-        local names, stale = {}, 0
-        for name in pairs(BZ.data) do table.insert(names, name) end
+        local names, stale, elsewhere = {}, 0, 0
+        for name, entry in pairs(BZ.data) do
+            -- Another realm's characters are kept but not listed: nothing of
+            -- theirs is reachable from here, and they are read on their realm.
+            if name == me or BZ.OnThisRealm(entry) then
+                table.insert(names, name)
+            else
+                elsewhere = elsewhere + 1
+            end
+        end
         table.sort(names)
         BZ.Say("known characters:")
         for _, name in ipairs(names) do
@@ -1529,6 +1693,10 @@ SlashCmdList["BAGERTZ"] = function(msg)
                 "from the version that synced over addon messages|r - they have " ..
                 "no file in the folder. |cFFFFFFFF/bz clear|r drops them; each " ..
                 "one reappears once you log it in.")
+        end
+        if elsewhere > 0 then
+            BZ.Say("|cFF888888plus " .. elsewhere .. " character(s) on other " ..
+                "realms, shown when you play there.|r")
         end
         if table.getn(names) <= 1 then
             BZ.Say("|cFF888888Only this character so far. Log another one in " ..

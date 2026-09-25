@@ -40,9 +40,38 @@ local Stub = {}
 -- ---------------------------------------------------------------------------
 string.gfind = string.gfind or string.gmatch
 table.getn = table.getn or function(t) return #t end
-math.mod = math.mod or function(a, b) return a % b end
+-- 5.0's math.mod is C fmod: the result takes the sign of the DIVIDEND. Lua's
+-- % operator floors instead, and the two disagree on every negative operand.
+math.mod = math.mod or math.fmod
 unpack = unpack or table.unpack
 loadstring = loadstring or load
+
+--[[ The client's %d is 32 bits. Its Lua is a 32-bit MSVC build, and %d goes
+     through a C int: every value from 2^31 up comes out as -2147483648. This
+     Lua has 64-bit integers and prints it correctly, which is how a pairing
+     tag that was broken in the game for half of all values passed every test
+     here. Anything formatted with %d is clamped the way the client clamps it. ]]
+do
+    local realFormat = string.format
+    string.format = function(fmt, ...)
+        local args = table.pack(...)
+        if type(fmt) == "string" then
+            local i = 0
+            for spec in string.gmatch(fmt, "%%[-+ #0]*%d*%.?%d*[%a%%]") do
+                if spec ~= "%%" then
+                    i = i + 1
+                    local conv = string.sub(spec, -1)
+                    local v = args[i]
+                    if (conv == "d" or conv == "i") and type(v) == "number"
+                       and (v >= 2147483648 or v < -2147483648) then
+                        args[i] = -2147483648
+                    end
+                end
+            end
+        end
+        return realFormat(fmt, table.unpack(args, 1, args.n))
+    end
+end
 
 -- ---------------------------------------------------------------------------
 -- Frames

@@ -74,6 +74,8 @@ end
 function activate(client)
     BZ = client.BZ
     UnitName = function(unit) return unit == "player" and client.name or nil end
+    -- Per client, so two realms can share one installation's folder.
+    GetRealmName = function() return client.realm or "N'Zoth" end
 
     WriteCustomFile = function(name, text, mode)
         if mode == "a" then FILES[name] = (FILES[name] or "") .. text
@@ -178,10 +180,10 @@ check("until she re-reads the folder", alice.BZ.data["Bob"].bags[2589], 7)
 ----------------------------------------------------------------------
 activate(bob)
 bob.BZ.WriteOwn()
-local aliceFile = FILES["Bagertz_Alice.txt"]
+local aliceFile = FILES["Bagertz_NZoth_Alice.txt"]
 check("Bob writing does not touch Alice's file",
     string.find(aliceFile, "Alice", 1, true) ~= nil, true)
-check("Bob's file is his own", FILES["Bagertz_Bob.txt"] ~= nil, true)
+check("Bob's file is his own", FILES["Bagertz_NZoth_Bob.txt"] ~= nil, true)
 
 --[[ Reading must not clobber what is live in memory. Our own file is at best
      as new as the last write, and the scan in memory is newer by definition. ]]
@@ -249,7 +251,7 @@ check("a rapid change is held rather than written", alice.BZ.writePending, true)
 NOW = NOW + 60
 alice.BZ.WriteOwn()
 check("and is on disk once the wait is over",
-    string.find(FILES["Bagertz_Alice.txt"], "B~2589", 1, true) ~= nil, true)
+    string.find(FILES["Bagertz_NZoth_Alice.txt"], "B~2589", 1, true) ~= nil, true)
 
 ----------------------------------------------------------------------
 -- without Nampower
@@ -352,6 +354,225 @@ check("this character is rescanned, not lost", alice.BZ.data["Alice"] ~= nil, tr
 SlashCmdList["BAGERTZ"]("stale")
 check("running it again with nothing stale is harmless",
     alice.BZ.data["Bob"] ~= nil, true)
+
+----------------------------------------------------------------------
+-- forgetting has to stick
+----------------------------------------------------------------------
+resetFolder()
+alice = newClient("Alice", ALICE_BAGS)
+bob = newClient("Bob", BOB_BAGS)
+login(bob)
+login(alice)
+activate(alice)
+check("Bob is there to forget", alice.BZ.data["Bob"] ~= nil, true)
+
+NOW = NOW + 10
+SlashCmdList["BAGERTZ"]("forget bob")
+check("forget drops him", alice.BZ.data["Bob"], nil)
+
+--[[ His file is still in the folder, and Lua cannot delete it. Without the
+     forget being remembered, the very next read put him straight back, which
+     made the command a no-op with a success message. ]]
+alice.BZ.ReadOthers()
+check("the next read of the folder does not bring him back", alice.BZ.data["Bob"], nil)
+SlashCmdList["BAGERTZ"]("read")
+check("nor does asking for a re-read", alice.BZ.data["Bob"], nil)
+
+-- Logging in again is what tells a live character from a deleted one.
+NOW = NOW + 10
+login(bob)
+activate(alice)
+alice.BZ.ReadOthers()
+check("once he logs in again he is back",
+    alice.BZ.data["Bob"] and alice.BZ.data["Bob"].bags[2589], 7)
+check("and the forget is used up", alice.BZ.config.forgotten["Bob"], nil)
+
+----------------------------------------------------------------------
+-- the account label travels in the file
+----------------------------------------------------------------------
+resetFolder()
+alice = newClient("Alice", ALICE_BAGS)
+bob = newClient("Bob", BOB_BAGS)
+alice.BZ.config.account = "Main"
+login(alice)
+login(bob)
+
+check("the label is written into the file",
+    string.find(FILES["Bagertz_NZoth_Alice.txt"], "\nA~Main\n", 1, true) ~= nil, true)
+check("an account without one writes none",
+    string.find(FILES["Bagertz_NZoth_Bob.txt"], "\nA~", 1, true), nil)
+activate(bob)
+check("the other account reads it", bob.BZ.data["Alice"].account, "Main")
+check("and shows it", bob.BZ.DisplayName("Alice"), "Main/Alice")
+
+-- Taking the label off has to reach the other account too, not linger there.
+activate(alice)
+alice.BZ.config.account = nil
+NOW = NOW + 10
+alice.BZ.WriteOwn()
+activate(bob)
+bob.BZ.ReadOthers()
+check("removing the label reaches the other account", bob.BZ.data["Alice"].account, nil)
+
+----------------------------------------------------------------------
+-- one folder, two realms
+----------------------------------------------------------------------
+
+--[[ The folder belongs to the installation, not the realm. Two characters
+     called Bob on two realms used to write one file between them, and each
+     login overwrote the other. ]]
+resetFolder()
+alice = newClient("Alice", ALICE_BAGS)
+bob = newClient("Bob", BOB_BAGS)
+local farBob = newClient("Bob", { [0] = { { id = 2589, count = 500 } } })
+farBob.realm = "Kel'Thuzad"
+local carol = newClient("Carol", { [0] = { { id = 2589, count = 40 } } })
+carol.realm = "Kel'Thuzad"
+login(bob)
+login(farBob)
+login(carol)
+login(alice)
+
+check("each Bob gets a file of his own",
+    FILES["Bagertz_NZoth_Bob.txt"] ~= nil and FILES["Bagertz_KelThuzad_Bob.txt"] ~= nil, true)
+check("and neither overwrote the other",
+    string.find(FILES["Bagertz_NZoth_Bob.txt"], "B~2589~7", 1, true) ~= nil, true)
+activate(alice)
+check("this realm's Bob is the one read",
+    alice.BZ.data["Bob"] and alice.BZ.data["Bob"].bags[2589], 7)
+check("another realm's character is never read", alice.BZ.data["Carol"], nil)
+
+activate(farBob)
+farBob.BZ.ReadOthers()
+check("the same holds from the other realm", farBob.BZ.data["Alice"], nil)
+check("where its own neighbour is read",
+    farBob.BZ.data["Carol"] and farBob.BZ.data["Carol"].bags[2589], 40)
+
+----------------------------------------------------------------------
+-- moving over from 2.0.0's file names
+----------------------------------------------------------------------
+
+--[[ 2.0.0 announced a bare name and wrote its file under it. Not every client
+     updates at the same moment, so for a while those have to keep working,
+     and then get out of the way. ]]
+resetFolder()
+FILES["Bagertz_roster.txt"] = "R~Bob\nR~Carol\n"
+FILES["Bagertz_Bob.txt"] = "BAGERTZ1\nM~Bob~N'Zoth~" .. (NOW - 100) .. "~0\nB~2589~3\n"
+FILES["Bagertz_Carol.txt"] = "BAGERTZ1\nM~Carol~Kel'Thuzad~" .. (NOW - 100) .. "~0\nB~2589~40\n"
+alice = newClient("Alice", ALICE_BAGS)
+login(alice)
+activate(alice)
+check("a file 2.0.0 wrote is still read",
+    alice.BZ.data["Bob"] and alice.BZ.data["Bob"].bags[2589], 3)
+check("but only if the realm inside it is this one", alice.BZ.data["Carol"], nil)
+
+bob = newClient("Bob", BOB_BAGS)
+login(bob)
+check("the updated character writes the new file",
+    FILES["Bagertz_NZoth_Bob.txt"] ~= nil, true)
+check("and empties the old one, so nobody goes on reading it",
+    FILES["Bagertz_Bob.txt"], "")
+activate(alice)
+alice.BZ.ReadOthers()
+check("the new file is the one read", alice.BZ.data["Bob"].bags[2589], 7)
+
+--[[ A client that loaded 2.0.0 before the update keeps writing the old name
+     until it reloads, so for a while both can be current. Newest wins,
+     whichever name it is under. ]]
+FILES["Bagertz_Bob.txt"] = "BAGERTZ1\nM~Bob~N'Zoth~" .. (NOW + 50) .. "~0\nB~2589~99\n"
+alice.BZ.ReadOthers()
+check("a newer file under the old name wins", alice.BZ.data["Bob"].bags[2589], 99)
+FILES["Bagertz_Bob.txt"] = "BAGERTZ1\nM~Bob~N'Zoth~" .. (NOW - 50) .. "~0\nB~2589~99\n"
+alice.BZ.ReadOthers()
+check("and an older one loses", alice.BZ.data["Bob"].bags[2589], 7)
+
+----------------------------------------------------------------------
+-- the account's other realms are kept, not shown
+----------------------------------------------------------------------
+
+--[[ SavedVariables are per account, not per realm, so the cache holds this
+     account's characters from every realm it plays on. None of them is read
+     from the folder here, which made them look exactly like leftovers from
+     the old sync -- and a bank dropped from the cache stays gone until that
+     character next stands at a bank. ]]
+resetFolder()
+alice = newClient("Alice", ALICE_BAGS)
+bob = newClient("Bob", BOB_BAGS)
+login(bob)
+login(alice)
+activate(alice)
+alice.BZ.data["Zed"] = { realm = "Kel'Thuzad", time = NOW, mine = true,
+                         bags = { [2589] = 5 }, bank = { [2589] = 70 } }
+
+SlashCmdList["BAGERTZ"]("stale")
+check("/bz stale leaves another realm's characters alone", alice.BZ.data["Zed"] ~= nil, true)
+SlashCmdList["BAGERTZ"]("clear")
+check("and so does /bz clear, bank and all",
+    alice.BZ.data["Zed"] and alice.BZ.data["Zed"].bank[2589], 70)
+
+local said = {}
+local realSay = alice.BZ.Say
+alice.BZ.Say = function(msg) table.insert(said, msg) end
+SlashCmdList["BAGERTZ"]("")
+alice.BZ.Say = realSay
+local shown = table.concat(said, "\n")
+check("/bz does not list them among this realm's", string.find(shown, "Zed", 1, true), nil)
+check("nor call them leftovers", string.find(shown, "left over", 1, true), nil)
+check("but says they are there",
+    string.find(shown, "1 character(s) on other realms", 1, true) ~= nil, true)
+
+local zedRelayed = false
+for _, n in ipairs(alice.BZ.OwnedCharacters()) do
+    if n == "Zed" then zedRelayed = true end
+end
+check("and a link partner never hears of them", zedRelayed, false)
+
+----------------------------------------------------------------------
+-- clearing is not a trip to the bank
+----------------------------------------------------------------------
+resetFolder()
+alice = newClient("Alice", ALICE_BAGS, ALICE_BANK)
+activate(alice)
+alice.BZ.atBank = true
+login(alice)
+alice.BZ.atBank = false
+NOW = NOW + 10
+SlashCmdList["BAGERTZ"]("clear")
+local aliceBank = alice.BZ.data["Alice"] and alice.BZ.data["Alice"].bank
+check("/bz clear keeps this character's bank", aliceBank and aliceBank[2589], 100)
+check("and does not write it out of the file",
+    string.find(FILES["Bagertz_NZoth_Alice.txt"], "K~2589~100", 1, true) ~= nil, true)
+
+--[[ Keyed by name, the cache can hold a same-named character from another
+     realm. Its bank is not this one's. ]]
+resetFolder()
+bob = newClient("Bob", BOB_BAGS)
+activate(bob)
+bob.BZ.data["Bob"] = { realm = "Kel'Thuzad", time = NOW, mine = true,
+                       bags = { [2589] = 500 }, bank = { [2589] = 900 } }
+login(bob)
+check("a same-named character on another realm does not lend its bank",
+    bob.BZ.data["Bob"].bank and bob.BZ.data["Bob"].bank[2589], nil)
+check("nor does it reach this Bob's file",
+    string.find(FILES["Bagertz_NZoth_Bob.txt"], "\nK~", 1, true), nil)
+
+-- Nor is the file 2.0.0 wrote forgotten as a place a bank can come back from.
+resetFolder()
+FILES["Bagertz_Zed.txt"] = "BAGERTZ1\nM~Zed~N'Zoth~900~900\nK~2589~60\n"
+local zed = newClient("Zed", BOB_BAGS)
+login(zed)
+check("a bank comes back from the file 2.0.0 wrote",
+    zed.BZ.data["Zed"].bank and zed.BZ.data["Zed"].bank[2589], 60)
+check("and moves into the new file with it",
+    string.find(FILES["Bagertz_NZoth_Zed.txt"], "K~2589~60", 1, true) ~= nil, true)
+
+-- Under the old naming, the file could as easily be another realm's Bob.
+resetFolder()
+FILES["Bagertz_Bob.txt"] = "BAGERTZ1\nM~Bob~Kel'Thuzad~900~0\nB~2589~500\n"
+bob = newClient("Bob", BOB_BAGS)
+login(bob)
+check("an old file that is another realm's Bob is left alone",
+    string.find(FILES["Bagertz_Bob.txt"], "Kel'Thuzad", 1, true) ~= nil, true)
 
 print(string.format("\n%d checks, %d failed\n", checks, failures))
 if failures > 0 then os.exit(1) end

@@ -243,6 +243,66 @@ check("an unasked-for acceptance does not blow up", ok, true)
 check("an unasked-for acceptance is ignored", alice.BZ.config.partner, nil)
 
 ----------------------------------------------------------------------
+-- tags from the top half of the hash range
+----------------------------------------------------------------------
+
+--[[ The client prints %d through a 32-bit int, so every hash from 2^31 up
+     came out as -2147483648 and the receiver dropped it: half of all beacons
+     and transfers, silently. The nonce is random, so an ordinary run only
+     sometimes lands in that half. This one always does, and the stub prints
+     %d the way the client does. ]]
+alice = newClient("Alice", ALICE_BAGS, "pc1")
+pat = newClient("Pat", PAT_BAGS, "pc2")
+activate(alice) alice.BZ.Share("Pat")
+deliverWhispers(alice, pat)
+activate(pat) pat.BZ.AcceptPair()
+deliverWhispers(pat, alice)
+activate(alice) alice.BZ.UpdateOwnData()
+activate(pat) pat.BZ.UpdateOwnData()
+
+local bigNonce
+activate(alice)
+for n = 100000, 999999 do
+    if alice.BZ.Hash(alice.BZ.config.password .. ":" .. n) >= 2147483648 then
+        bigNonce = n
+        break
+    end
+end
+check("there is a nonce whose tag needs all 32 bits", bigNonce ~= nil, true)
+
+local realRandom = math.random
+math.random = function() return bigNonce end
+
+activate(alice) alice.BZ.SendBeacon()
+while table.getn(alice.BZ.sendQueue) > 0 do alice.BZ.DrainQueue() end
+local beacon = alice.addon[1] and alice.addon[1].msg or ""
+local _, _, wireTag = string.find(beacon, "^B~%d+~([^~]+)~")
+check("the tag goes out as a plain number",
+    string.find(wireTag or "", "^%d+$") ~= nil, true)
+check("with every digit of it", tonumber(wireTag or "0") >= 2147483648, true)
+
+deliverAddon(alice, pat)       -- Pat meets Alice and answers with his roster
+deliverAddon(pat, alice)
+activate(pat) pat.BZ.SendBeacon()
+deliverAddon(pat, alice)       -- Alice meets Pat and answers with hers
+deliverAddon(alice, pat)
+math.random = realRandom
+
+activate(pat)
+check("the beacon is accepted", pat.BZ.peers["Alice"] ~= nil, true)
+check("Alice's bags cross", pat.BZ.data["Alice"] and pat.BZ.data["Alice"].bags[2589], 20)
+check("with nothing refused on the way", pat.BZ.stats.rejected, 0)
+activate(alice)
+check("and Pat's cross the other way",
+    alice.BZ.data["Pat"] and alice.BZ.data["Pat"].bags[4306], 9)
+check("refused nowhere", alice.BZ.stats.rejected, 0)
+
+--[[ A linked partner's characters have no file in this folder and never will:
+     they are current, not leftovers from the old sync. ]]
+SlashCmdList["BAGERTZ"]("stale")
+check("/bz stale keeps a linked partner's characters", alice.BZ.data["Pat"] ~= nil, true)
+
+----------------------------------------------------------------------
 -- unlinked means silent
 ----------------------------------------------------------------------
 alice = newClient("Alice", ALICE_BAGS, "pc1")
