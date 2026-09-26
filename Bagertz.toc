@@ -1,7 +1,7 @@
 ## Interface: 11200
-## Version: 2.0.1
+## Version: 2.1.0
 ## Title: Bagertz
-## Notes: Shows how many of an item your other characters are carrying - including characters on a different WoW account. Your own accounts share a file in CustomData with no setup; an optional link shares with someone on another PC.
+## Notes: Shows how many of an item your other characters are carrying, and their gold - including characters on a different WoW account. Your own accounts share a file in CustomData with no setup; an optional link shares with someone on another PC.
 ## Author: You
 ## SavedVariables: Bagertz_Data, Bagertz_Config
 Bagertz.lua

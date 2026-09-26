@@ -1,4 +1,4 @@
-# Bagertz (v2.0.1)
+# Bagertz (v2.1.0)
 
 Shows how many of an item your **other characters** are carrying, right in the item's tooltip — including characters on a **different WoW account**, which is the part nothing else does.
 
@@ -23,6 +23,14 @@ The realm is in the file name because the folder belongs to the installation, no
 ### Setup
 
 None. Log a character in and it appears. Log another in — on either account — and each sees the other.
+
+## Gold across accounts
+
+Each character's file carries its gold too, so **`/bz gold`** lists the gold of every character on this realm, from every account on this install, each with its account's label, and adds it all up.
+
+If you use **Bagshui**, hover the gold in its bag window. Below Bagshui's own list of this account's characters you get your **other account's** characters, and an **All accounts** total. Bagshui's own files are not changed, so updating Bagshui can't undo it. Nobody it already lists is listed twice, and a linked partner's characters aren't counted — that's their gold, not yours.
+
+A character's gold is recorded the next time it logs in with Bagertz 2.1, and kept current from then on.
 
 ## What the folder replaced, and why
 
@@ -73,6 +81,7 @@ where addon messages travel.
 | --- | --- |
 | `/bz` | Status: the folder, your file, and every character known |
 | `/bz read` | Re-read the folder now (also `/bz sync`) |
+| `/bz gold` | Every character's gold on this realm, from every account, and the total |
 | `/bz account <name>` | Label this account, shown beside its characters — on your other account too |
 | `/bz zero on\|off` | Whether a tooltip says so when nobody holds the item |
 | `/bz forget <name>` | Drop one character, e.g. one you deleted; it stays gone unless it logs in again |
@@ -90,3 +99,4 @@ where addon messages travel.
     lua tools/test_files.lua                 # two clients, one shared folder
     lua tools/test_pairing.lua               # linking two PCs, and unlinking
     lua tools/test_tooltips.lua              # what the tooltip actually says
+    lua tools/test_gold.lua                  # gold across accounts, and Bagshui's gold tooltip

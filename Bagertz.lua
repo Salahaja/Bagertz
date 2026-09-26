@@ -18,8 +18,8 @@
     it. Two clients launched from the same install therefore share it, whatever
     accounts they are logged into. That is the whole mechanism.
 
-    Each character writes ONE file of its own, Bagertz_<Character>.txt, and
-    reads everyone else's. Nothing is ever written by two clients at once, so
+    Each character writes ONE file of its own, Bagertz_<Realm>_<Character>.txt,
+    and reads everyone else's. Nothing is ever written by two clients at once, so
     there is no contention to arbitrate - which a single shared file would have
     had, and which is why this is not one. A roster file is appended to once per
     login so a client knows which files exist; Lua cannot list a directory.
@@ -46,12 +46,15 @@
     "Linking with someone on another PC" below), and it is off - and silent -
     until both of you agree to it.
 
+    The file carries the character's gold as well, so /bz gold - and Bagshui's
+    gold tooltip, when Bagshui is installed - can count every account.
+
     Slash commands: /bagertz (or /bz)
 --]]
 
 BZ = {}
 BZ.ADDON_NAME = "Bagertz"
-BZ.VERSION    = "2.0.1"
+BZ.VERSION    = "2.1.0"
 
 BZ.data   = {} -- [charName] = { realm, time, mine, bags = { [itemID] = count } }
 BZ.config = {} -- { debug, showZero, account, password, partner = { name, account } }
@@ -260,6 +263,11 @@ function BZ.UpdateOwnData()
     -- is somebody else's file and is never rewritten by us.
     entry.mine  = true
     entry.bags  = BZ.ScanBags()
+    -- Gold and class travel in the file too, so the other account can count
+    -- this character's gold and color its name.
+    if GetMoney then entry.money = GetMoney() end
+    local _, class = UnitClass("player")
+    if class then entry.class = class end
     if BZ.atBank then
         entry.bank = BZ.ScanBank()
         entry.bankTime = time()
@@ -327,6 +335,8 @@ end
        BAGERTZ1
        M~name~realm~time~bankTime
        A~label             (the account's label, only when it has one)
+       G~copper            (gold, since 2.1.0)
+       C~CLASS             (class, since 2.1.0)
        B~itemId~count      (bags)
        K~itemId~count      (bank)
 ]]
@@ -339,6 +349,8 @@ function BZ.Serialize(name, entry)
     if entry.account and entry.account ~= "" then
         table.insert(out, "A~" .. entry.account)
     end
+    if entry.money then table.insert(out, "G~" .. entry.money) end
+    if entry.class then table.insert(out, "C~" .. entry.class) end
     for id, count in pairs(entry.bags or {}) do
         table.insert(out, "B~" .. id .. "~" .. count)
     end
@@ -361,6 +373,10 @@ function BZ.Deserialize(text)
             entry.bankTime = tonumber(d) or 0
         elseif kind == "A" then
             if a ~= "" then entry.account = a end
+        elseif kind == "G" then
+            entry.money = tonumber(a)
+        elseif kind == "C" then
+            if a ~= "" then entry.class = a end
         elseif kind == "B" then
             local id, n = tonumber(a), tonumber(b)
             if id and n then entry.bags[id] = n end
@@ -1477,6 +1493,141 @@ end
 
 
 -- ---------------------------------------------------------------------------------------------
+-- Gold across accounts
+-- ---------------------------------------------------------------------------------------------
+
+--[[ Every character's gold travels in its file with its bags, so the other
+     account's gold can be counted as well as its items. This realm only, as
+     with items. A linked partner's characters are someone else's gold, and
+     are left out. ]]
+
+--- 12g 34s 56c, in the game's own colors.
+function BZ.FormatMoney(copper)
+    copper = math.floor(copper or 0)
+    local gold = math.floor(copper / 10000)
+    local silver = math.floor(math.mod(copper, 10000) / 100)
+    local rest = math.mod(copper, 100)
+    local s = ""
+    if gold > 0 then s = "|cffffffff" .. gold .. "|cffffd700g|r " end
+    if gold > 0 or silver > 0 then s = s .. "|cffffffff" .. silver .. "|cffc7c7cfs|r " end
+    return s .. "|cffffffff" .. rest .. "|cffeda55fc|r"
+end
+
+--- This realm's characters whose gold is known, richest first:
+--- { name, money, class, account }.
+function BZ.GoldList()
+    local me, list = BZ.Me(), {}
+    for name, entry in pairs(BZ.data) do
+        if type(entry.money) == "number" and not entry.fromChannel and BZ.OnThisRealm(entry) then
+            local account = entry.account
+            if name == me then account = BZ.config.account or account end
+            if account == "" then account = nil end
+            table.insert(list, { name = name, money = entry.money, class = entry.class,
+                                 account = account })
+        end
+    end
+    table.sort(list, function(a, b)
+        if a.money ~= b.money then return a.money > b.money end
+        return a.name < b.name
+    end)
+    return list
+end
+
+--- A name in its class color, with its account's label after it.
+function BZ.GoldName(c)
+    local name = c.name
+    local color = c.class and RAID_CLASS_COLORS and RAID_CLASS_COLORS[c.class]
+    if color then
+        name = string.format("|cff%02x%02x%02x", math.floor(color.r * 255 + 0.5),
+            math.floor(color.g * 255 + 0.5), math.floor(color.b * 255 + 0.5)) .. name .. "|r"
+    end
+    if c.account then name = name .. " |cff888888(" .. c.account .. ")|r" end
+    return name
+end
+
+function BZ.PrintGold()
+    local list, total = BZ.GoldList(), 0
+    if table.getn(list) == 0 then
+        BZ.Say("no gold known yet - each character is counted once it has logged in " ..
+            "with this version.")
+        return
+    end
+    BZ.Say("gold on " .. (GetRealmName() or "this realm") .. ", every account:")
+    for i = 1, table.getn(list) do
+        BZ.Say("  " .. BZ.GoldName(list[i]) .. "  " .. BZ.FormatMoney(list[i].money))
+        total = total + list[i].money
+    end
+    BZ.Say("  total: " .. BZ.FormatMoney(total))
+end
+
+--- Bagshui's own name for its gold "item", where it keeps it.
+function BZ.BagshuiMoneyKey()
+    local env = Bagshui and Bagshui.environment
+    local locations = env and env.BS_CATALOG_LOCATIONS
+    return (locations and locations.MONEY) or "$$$"
+end
+
+--[[ Below Bagshui's own gold lines: the characters it does not know - your
+     other account's, since its saved data is per account - then what every
+     account comes to. Nothing is added before Bagshui has read its own data,
+     and nothing it already lists is listed twice. ]]
+function BZ.AddOtherAccountsGold(catalog, tooltip)
+    if not catalog.initialized or type(catalog.totals) ~= "table" then return false end
+    local here = catalog.totals[GetRealmName()]
+    local known = {}
+    local listed = here and here._sortedCharacterList
+    if type(listed) == "table" then
+        for i = 1, table.getn(listed) do known[listed[i]] = true end
+    end
+
+    local others, total, list = {}, 0, BZ.GoldList()
+    for i = 1, table.getn(list) do
+        if not known[list[i].name] then
+            table.insert(others, list[i])
+            total = total + list[i].money
+        end
+    end
+    if table.getn(others) == 0 then return false end
+
+    local format = BZ.FormatMoney
+    local util = Bagshui.components.Util
+    if util and type(util.FormatMoneyString) == "function" then format = util.FormatMoneyString end
+    local hi = HIGHLIGHT_FONT_COLOR_CODE or "|cffffffff"
+    local close = FONT_COLOR_CODE_CLOSE or "|r"
+
+    tooltip:AddDoubleLine(hi .. "Other accounts" .. close, hi .. format(total) .. close)
+    for i = 1, table.getn(others) do
+        tooltip:AddDoubleLine("  " .. BZ.GoldName(others[i]), format(others[i].money))
+    end
+    -- This account's, as Bagshui counts it, and everyone else's.
+    local ok, mine = pcall(catalog.GetTotal, catalog, here, nil, BZ.BagshuiMoneyKey())
+    if ok and type(mine) == "number" then
+        tooltip:AddDoubleLine(hi .. "All accounts" .. close, hi .. format(mine + total) .. close)
+    end
+    return true
+end
+
+--[[ Bagshui's gold tooltip lists the characters in its own saved data, which
+     the game keeps per account - so it never sees your other account. Its
+     tooltip function is wrapped rather than its files edited, so updating
+     Bagshui cannot undo this. Called once everything has loaded: Bagshui
+     loads after Bagertz, and builds this only once it has loaded. ]]
+function BZ.HookBagshui()
+    if BZ.bagshuiHooked then return end
+    local catalog = Bagshui and Bagshui.components and Bagshui.components.Catalog
+    if type(catalog) ~= "table" or type(catalog.AddTooltipInfo) ~= "function" then return end
+    BZ.bagshuiHooked = true
+    local original = catalog.AddTooltipInfo
+    catalog.AddTooltipInfo = function(self, itemString, tooltip)
+        local added = original(self, itemString, tooltip)
+        if itemString == BZ.BagshuiMoneyKey() and BZ.AddOtherAccountsGold(self, tooltip) then
+            added = true
+        end
+        return added
+    end
+end
+
+-- ---------------------------------------------------------------------------------------------
 -- Slash commands
 -- ---------------------------------------------------------------------------------------------
 SLASH_BAGERTZ1 = "/bagertz"
@@ -1494,6 +1645,9 @@ SlashCmdList["BAGERTZ"] = function(msg)
 
     elseif cmd == "link?" or cmd == "sharing" then
         BZ.TogglePairPanel()
+
+    elseif cmd == "gold" or cmd == "money" then
+        BZ.PrintGold()
 
     elseif cmd == "read" or cmd == "sync" then
         -- "sync" kept as a word people will reach for out of habit; there is
@@ -1704,7 +1858,7 @@ SlashCmdList["BAGERTZ"] = function(msg)
         end
 
     else
-        BZ.Say("usage: /bz, /bz read, /bz stale, /bz account <name>, /bz zero on|off,")
+        BZ.Say("usage: /bz, /bz gold, /bz read, /bz stale, /bz account <name>, /bz zero on|off,")
         BZ.Say("       /bz forget <name>, /bz clear, /bz tips, /bz debug")
         BZ.Say("another PC: /bz share <character>, /bz sharing, /bz unlink")
     end
@@ -1717,6 +1871,7 @@ ev:RegisterEvent("ADDON_LOADED")
 ev:RegisterEvent("PLAYER_ENTERING_WORLD")
 ev:RegisterEvent("PLAYER_LOGOUT")
 ev:RegisterEvent("BAG_UPDATE")
+ev:RegisterEvent("PLAYER_MONEY")
 ev:RegisterEvent("BANKFRAME_OPENED")
 ev:RegisterEvent("BANKFRAME_CLOSED")
 ev:RegisterEvent("PLAYERBANKSLOTS_CHANGED")
@@ -1744,6 +1899,7 @@ ev:SetScript("OnEvent", function()
         BZ.JoinRoster()
         BZ.UpdateOwnData()
         BZ.ReadOthers()
+        BZ.HookBagshui()
 
     elseif event == "PLAYER_LOGOUT" then
         --[[ The last word. Everything since the previous write is only in
@@ -1762,9 +1918,11 @@ ev:SetScript("OnEvent", function()
     elseif event == "PARTY_MEMBERS_CHANGED" or event == "RAID_ROSTER_UPDATE" then
         BZ.beaconTimer = BZ.BEACON_INTERVAL -- beacon on the next tick
 
-    elseif event == "BAG_UPDATE" or event == "PLAYERBANKSLOTS_CHANGED" then
+    elseif event == "BAG_UPDATE" or event == "PLAYERBANKSLOTS_CHANGED" or event == "PLAYER_MONEY" then
         -- Debounced: looting a stack fires this several times in a row, and
-        -- rescanning every bag on each one is wasted work.
+        -- rescanning every bag on each one is wasted work. Gold changes the
+        -- same way - a vendor run is a burst of them - and goes in the same
+        -- file.
         BZ.scanTimer = BZ.SCAN_DEBOUNCE
 
     elseif event == "BANKFRAME_OPENED" then
