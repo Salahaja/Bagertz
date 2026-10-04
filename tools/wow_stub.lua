@@ -325,6 +325,23 @@ function Stub.InstallGlobals()
     GetNumPartyMembers = function() return #Stub.roster.party end
     GetNumRaidMembers = function() return #Stub.roster.raid end
 
+    --[[ Reads the real .toc, so a version the addon reports and a version the
+         addon ships as cannot drift apart without a test noticing. They did
+         exactly that in a sibling addon, which spent a session being debugged
+         against the wrong code. ]]
+    GetAddOnMetadata = function(addon, field)
+        local f = io.open((addon or "") .. ".toc", "r")
+        if not f then return nil end
+        local want = string.lower(field or "")
+        local found
+        for line in f:lines() do
+            local _, _, key, value = string.find(line, "^##%s*([^:]+):%s*(.-)%s*$")
+            if key and string.lower(key) == want then found = value end
+        end
+        f:close()
+        return found
+    end
+
     IsShiftKeyDown = function() return Stub.shiftDown and 1 or nil end
     IsControlKeyDown = function() return Stub.ctrlDown and 1 or nil end
     IsAltKeyDown = function() return nil end

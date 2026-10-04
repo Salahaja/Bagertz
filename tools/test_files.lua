@@ -38,8 +38,15 @@ end
      makes two accounts able to see each other: they are one installation with
      one CustomData. ]]
 local FILES = {}
+--[[ How many times each file has been written and read. Needed because the
+     thing under test is work NOT done: an addon that rewrites an identical
+     file leaves a folder indistinguishable from one that skipped the write,
+     and the whole point is the writing. ]]
+local WRITES, READS = {}, {}
 local function resetFolder()
     for k in pairs(FILES) do FILES[k] = nil end
+    for k in pairs(WRITES) do WRITES[k] = nil end
+    for k in pairs(READS) do READS[k] = nil end
 end
 
 local NOW = 1000
@@ -78,10 +85,14 @@ function activate(client)
     GetRealmName = function() return client.realm or "N'Zoth" end
 
     WriteCustomFile = function(name, text, mode)
+        WRITES[name] = (WRITES[name] or 0) + 1
         if mode == "a" then FILES[name] = (FILES[name] or "") .. text
         else FILES[name] = text end
     end
-    ReadCustomFile = function(name) return FILES[name] end
+    ReadCustomFile = function(name)
+        READS[name] = (READS[name] or 0) + 1
+        return FILES[name]
+    end
 
     local function container(bag)
         if bag <= -1 or bag >= 5 then
@@ -107,10 +118,17 @@ function activate(client)
 end
 
 --- Log a character in: announce itself, scan, and read everyone else.
+--[[ What PLAYER_ENTERING_WORLD does, in the same order.
+
+     The forced write belongs to logging in, not to the write rate-limiter: a
+     character whose bags are exactly as it left them still has to stamp its
+     file, or it has no way to tell a client that forgot it that it is being
+     played again. ]]
 local function login(client)
     activate(client)
     client.BZ.JoinRoster()
     client.BZ.UpdateOwnData()
+    client.BZ.WriteOwn(true)
     client.BZ.ReadOthers()
 end
 
@@ -573,6 +591,159 @@ bob = newClient("Bob", BOB_BAGS)
 login(bob)
 check("an old file that is another realm's Bob is left alone",
     string.find(FILES["Bagertz_Bob.txt"], "Kel'Thuzad", 1, true) ~= nil, true)
+
+
+----------------------------------------------------------------------
+-- only changes
+--
+-- The events that bring Bagertz back to the bags have no idea whether
+-- anything moved. BAG_UPDATE fires several times for one loot; PLAYER_MONEY
+-- fires when a vendor pays you the copper you just spent; opening the bank
+-- rescans everything. Each of those used to be a full write that every other
+-- character on the machine then read and parsed in full.
+--
+-- What is checked below is therefore work that does NOT happen, which is why
+-- the harness counts writes and parses rather than looking at the contents.
+----------------------------------------------------------------------
+resetFolder()
+alice = newClient("Alice", ALICE_BAGS, ALICE_BANK)
+login(alice)
+activate(alice)
+
+local ALICE_FILE = "Bagertz_NZoth_Alice.txt"
+local writesAfterLogin = WRITES[ALICE_FILE]
+check("logging in writes the file", writesAfterLogin ~= nil and writesAfterLogin > 0, true)
+
+-- A rescan of bags nobody touched.
+NOW = NOW + 10
+alice.BZ.UpdateOwnData()
+check("a rescan that found nothing new does not rewrite the file",
+    WRITES[ALICE_FILE], writesAfterLogin)
+
+-- Five of them, as a burst of BAG_UPDATEs looks from here.
+for _ = 1, 5 do
+    NOW = NOW + 10
+    alice.BZ.UpdateOwnData()
+end
+check("nor do five of them", WRITES[ALICE_FILE], writesAfterLogin)
+
+--[[ The same contents reached a different way. ScanBags rebuilds the table
+     every time, so an item that moved bags can come back in a different
+     iteration order -- which a naive comparison reads as a change. ]]
+NOW = NOW + 10
+alice.bags = {
+    [0] = { { id = 4306, count = 8 }, { id = 2589, count = 12 } },
+    [1] = { { id = 858, count = 5 }, { id = 2589, count = 20 } },
+}
+alice.BZ.UpdateOwnData()
+check("rearranging bags without changing what is in them does not write",
+    WRITES[ALICE_FILE], writesAfterLogin)
+
+--[[ Both halves of this rest on one property: identical contents must produce
+     identical bytes, or the writer sees a change where there is none and the
+     reader re-parses a file that did not move.
+
+     Asserted directly, not through the check above. That one passes either
+     way under Lua 5.4, whose table order happened not to shift for these
+     keys; Lua 5.0 on the client promises nothing of the sort, so the order
+     being deliberate is the thing worth pinning. ]]
+check("packed counts come out in id order",
+    alice.BZ.PackCounts({ [4306] = 1, [858] = 2, [2589] = 3 }),
+    "858:2,2589:3,4306:1")
+local serialized = alice.BZ.Serialize("Alice", {
+    realm = "N'Zoth", time = 1, bags = { [4306] = 1, [858] = 2 }, bank = {},
+})
+check("and so do the item lines in the file",
+    string.find(serialized, "B~858~2\nB~4306~1", 1, true) ~= nil, true)
+
+-- And a real change still gets through, which is the half that matters.
+NOW = NOW + 10
+alice.bags[0][1].count = 9
+alice.BZ.UpdateOwnData()
+check("but looting one more of something does write",
+    WRITES[ALICE_FILE] > writesAfterLogin, true)
+check("and the new count is in the file",
+    string.find(FILES[ALICE_FILE], "B~4306~9", 1, true) ~= nil, true)
+
+-- Gold travels in the same file and arrives by the same blunt event.
+local writesBeforeGold = WRITES[ALICE_FILE]
+NOW = NOW + 10
+alice.BZ.UpdateOwnData()
+check("being paid nothing does not write", WRITES[ALICE_FILE], writesBeforeGold)
+GetMoney = function() return 12345 end
+NOW = NOW + 10
+alice.BZ.UpdateOwnData()
+check("being paid something does", WRITES[ALICE_FILE] > writesBeforeGold, true)
+
+-- Changing the account label is a change like any other.
+local writesBeforeLabel = WRITES[ALICE_FILE]
+alice.BZ.config.account = "Main"
+alice.BZ.WriteOwn()
+check("labelling the account writes", WRITES[ALICE_FILE] > writesBeforeLabel, true)
+
+----------------------------------------------------------------------
+-- and the same from the reading end
+----------------------------------------------------------------------
+bob = newClient("Bob", BOB_BAGS)
+login(bob)
+activate(bob)
+-- 32, not 20: Alice carries 2589 in two bags, and a count is per character.
+check("Bob read Alice out of the folder",
+    bob.BZ.data["Alice"] and bob.BZ.data["Alice"].bags[2589], 32)
+
+--[[ Parsing is what costs here, not reading: this runs every twenty seconds
+     for every character you have ever logged in, and almost every time the
+     answer is that nobody has touched a bag. Counted by swapping in a
+     Deserialize that tallies the calls, because the result of skipping it is
+     by design identical to the result of doing it. ]]
+local realDeserialize = bob.BZ.Deserialize
+local parses = 0
+bob.BZ.Deserialize = function(text)
+    parses = parses + 1
+    return realDeserialize(text)
+end
+
+NOW = NOW + 10
+local found = bob.BZ.ReadOthers()
+check("an unchanged file is not parsed again", parses, 0)
+check("and the character is still reported as present", found, 1)
+check("and is still there to be asked about",
+    bob.BZ.data["Alice"] and bob.BZ.data["Alice"].bags[2589], 32)
+
+--[[ The failure that would matter: a change arriving after a skip. Get this
+     wrong and tooltips silently freeze at whatever they said first, which
+     looks exactly like the addon working. ]]
+activate(alice)
+NOW = NOW + 10
+alice.bags[1][2].count = 31
+alice.BZ.UpdateOwnData()
+activate(bob)
+NOW = NOW + 10
+bob.BZ.ReadOthers()
+check("a file that did change is parsed", parses > 0, true)
+check("and the new count arrives", bob.BZ.data["Alice"].bags[2589], 43)
+
+-- Emptying the cache of characters has to beat the cache of file contents,
+-- or /bz clear reports cheerfully that it found nobody.
+parses = 0
+SlashCmdList["BAGERTZ"]("clear")
+check("clearing the cache really re-reads the folder", parses > 0, true)
+check("and Alice comes straight back",
+    bob.BZ.data["Alice"] and bob.BZ.data["Alice"].bags[2589], 43)
+bob.BZ.Deserialize = realDeserialize
+GetMoney = function() return 0 end
+
+----------------------------------------------------------------------
+-- the version the addon reports is the version it ships as
+----------------------------------------------------------------------
+--[[ Not a detail. A hardcoded copy of the version only has to be forgotten
+     once, and from then on the addon reports a release the player is not
+     running -- which is how a sibling addon came to be debugged for a whole
+     session against entirely the wrong code. ]]
+local toc = io.open("Bagertz.toc", "r"):read("*a")
+local _, _, tocVersion = string.find(toc, "##%s*Version:%s*([^\r\n]+)")
+check("the .toc has a version", tocVersion ~= nil, true)
+check("and the addon reports that one", alice.BZ.VERSION, tocVersion)
 
 print(string.format("\n%d checks, %d failed\n", checks, failures))
 if failures > 0 then os.exit(1) end

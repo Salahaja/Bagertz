@@ -74,15 +74,23 @@ function activate(client)
         else FILES[name] = text end
     end
     ReadCustomFile = function(name) return FILES[name] end
+    client.addon = client.addon or {}
+    SendAddonMessage = function(prefix, msg, channel)
+        table.insert(client.addon, { prefix = prefix, msg = msg, channel = channel })
+    end
     GetContainerNumSlots = function() return 0 end
     GetContainerItemLink = function() return nil end
     GetContainerItemInfo = function() return nil end
 end
 
+--[[ What PLAYER_ENTERING_WORLD does, in the same order. The forced write
+     belongs to logging in: a character whose gold and bags are exactly as it
+     left them still has to stamp its file. ]]
 local function login(client)
     activate(client)
     client.BZ.JoinRoster()
     client.BZ.UpdateOwnData()
+    client.BZ.WriteOwn(true)
     client.BZ.ReadOthers()
 end
 
@@ -247,6 +255,215 @@ do
     SlashCmdList["BAGERTZ"]("gold")
     check("with no gold known, /bz gold says why",
         string.find(plain(table.concat(Stub.chat, "\n")), "no gold known yet", 1, true) ~= nil, true)
+end
+
+
+----------------------------------------------------------------------
+-- two accounts logged in at once
+--
+-- The case the folder exists for, and the one where "only write when
+-- something changed" could go wrong: both clients are live, each is the only
+-- author of its own file, and each has to notice the other's gold moving
+-- without anybody telling it to look.
+----------------------------------------------------------------------
+do
+    for k in pairs(FILES) do FILES[k] = nil end
+    NOW = NOW + 1000
+
+    local a = newClient("Alice", "MAGE", 1000000, "Main")
+    local b = newClient("Bob", "WARRIOR", 250000, "Alt")
+    login(a)
+    login(b)
+    activate(a) a.BZ.ReadOthers()   -- Bob's file exists now
+
+    activate(a)
+    check("Alice sees Bob's gold", a.BZ.data["Bob"] and a.BZ.data["Bob"].money, 250000)
+    activate(b)
+    check("Bob sees Alice's gold", b.BZ.data["Alice"] and b.BZ.data["Alice"].money, 1000000)
+
+    --[[ Bob earns some. The write is what the other client has to see, and
+         with "only write when changed" it happens only because the content key
+         covers gold as well as bags -- which is exactly the thing a bag-only
+         key would have missed. ]]
+    activate(b)
+    b.money = 275000
+    NOW = NOW + 10
+    fire(b, "PLAYER_MONEY")
+    tick(b, 3)                       -- past the scan debounce
+    check("Bob's own figure updates", b.BZ.data["Bob"].money, 275000)
+    check("and reaches his file",
+        string.find(FILES["Bagertz_NZoth_Bob.txt"] or "", "G~275000", 1, true) ~= nil, true)
+
+    activate(a)
+    NOW = NOW + 10
+    a.BZ.ReadOthers()
+    check("Alice picks the new figure up", a.BZ.data["Bob"].money, 275000)
+
+    -- And the other way, both still live.
+    activate(a)
+    a.money = 1500000
+    NOW = NOW + 10
+    fire(a, "PLAYER_MONEY")
+    tick(a, 3)
+    activate(b)
+    NOW = NOW + 10
+    b.BZ.ReadOthers()
+    check("Bob picks up Alice's", b.BZ.data["Alice"].money, 1500000)
+
+    --[[ Spending it, not just earning. A key that compared only "is there a
+         gold line" rather than its value would pass everything above. ]]
+    activate(b)
+    b.money = 1000
+    NOW = NOW + 10
+    fire(b, "PLAYER_MONEY")
+    tick(b, 3)
+    activate(a)
+    NOW = NOW + 10
+    a.BZ.ReadOthers()
+    check("a figure that went down is picked up too", a.BZ.data["Bob"].money, 1000)
+
+    -- Gold that did not move must not cost a write.
+    activate(b)
+    local writes = 0
+    local realWrite = WriteCustomFile
+    WriteCustomFile = function(n, t, m) writes = writes + 1 return realWrite(n, t, m) end
+    NOW = NOW + 10
+    fire(b, "PLAYER_MONEY")
+    tick(b, 3)
+    check("being paid nothing writes nothing", writes, 0)
+    WriteCustomFile = realWrite
+
+    ----------------------------------------------------------------------
+    -- and what each of them reports
+    ----------------------------------------------------------------------
+    activate(a)
+    Stub.chat = {}
+    SlashCmdList["BAGERTZ"]("gold")
+    local said = plain(table.concat(Stub.chat, "\n"))
+    check("Alice's report names her", string.find(said, "Alice", 1, true) ~= nil, true)
+    check("and Bob", string.find(said, "Bob", 1, true) ~= nil, true)
+    check("and both account labels",
+        string.find(said, "Main", 1, true) ~= nil
+            and string.find(said, "Alt", 1, true) ~= nil, true)
+    check("and totals the two", string.find(said, "total", 1, true) ~= nil, true)
+
+    activate(b)
+    Stub.chat = {}
+    SlashCmdList["BAGERTZ"]("gold")
+    said = plain(table.concat(Stub.chat, "\n"))
+    check("Bob's report names Alice too", string.find(said, "Alice", 1, true) ~= nil, true)
+    check("and himself", string.find(said, "Bob", 1, true) ~= nil, true)
+
+    --[[ A character that has never logged in since gold was added has no
+         figure at all, and must be left out rather than counted as zero --
+         which would quietly understate the total. ]]
+    FILES["Bagertz_NZoth_Carol.txt"] =
+        "BAGERTZ1\nM~Carol~N'Zoth~" .. NOW .. "~0\nB~2589~5\n"
+    FILES["Bagertz_roster.txt"] = (FILES["Bagertz_roster.txt"] or "") .. "R~Carol~N'Zoth\n"
+    activate(a)
+    NOW = NOW + 10
+    a.BZ.ReadOthers()
+    check("a character with no gold line is read", a.BZ.data["Carol"] ~= nil, true)
+    check("but has no figure", a.BZ.data["Carol"].money, nil)
+    local inList = false
+    local list = a.BZ.GoldList()
+    for i = 1, table.getn(list) do
+        if list[i].name == "Carol" then inList = true end
+    end
+    check("and is left out of the gold report rather than counted as zero", inList, false)
+end
+
+
+----------------------------------------------------------------------
+-- the folder outranks the channel
+--
+-- Two accounts on one machine share the folder. Link them over the channel as
+-- well -- which /bz share lets you do, and which costs nothing to leave on --
+-- and each relays what it read from the folder to the other. That is right for
+-- a partner on another PC, who has no folder access. Here it is an echo.
+--
+-- The echo used to be applied, and applying it was expensive: the wire format
+-- carries bags and bank but NO GOLD, and the receiving client marked those
+-- characters as channel-sourced, which drops them straight out of /bz gold.
+-- You saw "Bagertz: updated N characters" and your other account's gold
+-- disappeared in the same breath.
+----------------------------------------------------------------------
+do
+    for k in pairs(FILES) do FILES[k] = nil end
+    NOW = NOW + 1000
+
+    local a = newClient("Ann", "MAGE", 900000, "Main")
+    local b = newClient("Ben", "WARRIOR", 400000, "Alt")
+    login(a)
+    login(b)
+    activate(a) a.BZ.ReadOthers()
+
+    activate(a)
+    check("Ann reads Ben's gold out of the folder",
+        a.BZ.data["Ben"] and a.BZ.data["Ben"].money, 400000)
+    local function counted(client, who)
+        activate(client)
+        local list = client.BZ.GoldList()
+        for i = 1, table.getn(list) do
+            if list[i].name == who then return true end
+        end
+        return false
+    end
+    check("and counts it", counted(a, "Ben"), true)
+
+    --[[ Now link them, as /bz share does, and let Ben broadcast. Both ends
+         need the same secret or the transfer is refused before it is read. ]]
+    activate(a) a.BZ.config.password = "shared"
+    activate(b) b.BZ.config.password = "shared"
+    b.BZ.peers["Ann"] = { time = NOW, channel = "PARTY" }
+    b.BZ.lastSent = {}
+    b.BZ.SendInventory("all")
+    while table.getn(b.BZ.sendQueue) > 0 do b.BZ.DrainQueue() end
+    local sent = b.addon
+    b.addon = {}
+    check("Ben actually broadcast something", table.getn(sent) > 0, true)
+
+    activate(a)
+    for i = 1, table.getn(sent) do
+        a.BZ.OnAddonMessage(sent[i].msg, "Ben")
+    end
+
+    --[[ The check that matters. Ben's entry came from the folder and the
+         channel has nothing better; it must not be demoted to a wire entry
+         that no longer counts. ]]
+    check("Ben's gold survives the broadcast",
+        a.BZ.data["Ben"] and a.BZ.data["Ben"].money, 400000)
+    check("he is still counted as coming from the folder",
+        a.BZ.data["Ben"].fromFile ~= nil, true)
+    check("and not as a channel entry", a.BZ.data["Ben"].fromChannel, nil)
+    check("so he is still in the gold report", counted(a, "Ben"), true)
+
+    Stub.chat = {}
+    SlashCmdList["BAGERTZ"]("gold")
+    check("which still names him",
+        string.find(plain(table.concat(Stub.chat, "\n")), "Ben", 1, true) ~= nil, true)
+
+    --[[ And it has to stay fixed. The read cache skips a file whose bytes have
+         not changed, so if anything ever does overwrite a file-backed entry,
+         the cache must notice and re-parse rather than go on skipping the one
+         file that would put it right. Simulated here by demoting the entry by
+         hand, which is precisely what the old receive path did. ]]
+    a.BZ.data["Ben"].fromFile = nil
+    a.BZ.data["Ben"].fromChannel = NOW
+    NOW = NOW + 10
+    a.BZ.ReadOthers()
+    check("a demoted entry is restored from its file on the next read",
+        a.BZ.data["Ben"].fromFile ~= nil, true)
+    check("with its gold back", a.BZ.data["Ben"].money, 400000)
+    check("and counting again", counted(a, "Ben"), true)
+
+    --[[ A genuine partner is still heard. The guard must key on "we have their
+         file", not on "a password is set", or linking with someone on another
+         PC would stop working entirely. ]]
+    activate(a)
+    a.BZ.OnAddonMessage("B~123456~" .. tostring(a.BZ.Tag("123456")) .. "~Zoe", "Zoe")
+    check("a stranger with the right secret is still paired with",
+        a.BZ.peers["Zoe"] ~= nil, true)
 end
 
 print(string.format("\n%d checks, %d failed\n", checks, failures))

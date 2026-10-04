@@ -54,7 +54,12 @@
 
 BZ = {}
 BZ.ADDON_NAME = "Bagertz"
-BZ.VERSION    = "2.1.0"
+--[[ Read from the .toc rather than written here twice. A hardcoded copy only
+     has to be forgotten once to start reporting a version the player is not
+     running, and the first thing that goes wrong is then diagnosed against
+     the wrong code. ]]
+BZ.VERSION    = (GetAddOnMetadata and GetAddOnMetadata("Bagertz", "Version"))
+                or "unknown"
 
 BZ.data   = {} -- [charName] = { realm, time, mine, bags = { [itemID] = count } }
 BZ.config = {} -- { debug, showZero, account, password, partner = { name, account } }
@@ -85,12 +90,30 @@ BZ.sendQueue     = {}
 BZ.sendTimer     = 0
 BZ.beaconTimer   = 0
 BZ.peers         = {}   -- [charName] = when a valid beacon was last heard
-BZ.incoming      = {}   -- [charName] = { nonce, chunks, expected, name }
+BZ.incoming      = {}   -- [charName] = { nonce, chunks, expected, mode, serial }
+
+--[[ What the far end has already been told, per character, so a bag change
+     costs a line about the one item rather than a retransmission of
+     everything. Paired with a serial per transfer: a delta applied to the
+     wrong starting point is worse than no delta at all, so the receiving end
+     checks it is not missing one before trusting it. ]]
+BZ.lastSent      = {}   -- [charName] = { bags, bank } as last sent
+BZ.sendSerial    = 0    -- transfers we have sent
+BZ.peerSerial    = {}   -- [charName] = the last serial we accepted from them
+BZ.lastBaselineAsk = nil
 BZ.inventoryDirty = true
 BZ.stats = { sent = 0, received = 0, rejected = 0 }
 BZ.readTimer     = 0
 BZ.lastWrite     = nil
 BZ.fileState     = "not checked yet"
+
+--[[ What was last written and last read, so neither side does the same work
+     twice. Both are about the same thing from opposite ends: a character's
+     bags change rarely, while the events that make us look at them fire
+     constantly, and without these every one of those events costs a full
+     serialize-and-write or a full read-and-parse of everybody. ]]
+BZ.lastContent   = nil  -- our own content key at the last write
+BZ.lastRead      = {}   -- [path] = { text, name } as it was last parsed
 -- ---------------------------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------------------------
@@ -340,6 +363,20 @@ end
        B~itemId~count      (bags)
        K~itemId~count      (bank)
 ]]
+--[[ Item lines in a stable order. Nothing reading the file cares, but two
+     things on this side do: an unchanged inventory has to serialize to exactly
+     the same bytes or BZ.ContentKey cannot tell "nothing changed" from "the
+     table rehashed", and a reader compares the text it just read against the
+     text it last parsed. `pairs` alone gives neither -- move an item between
+     bags and the contents are identical while the iteration order is not. ]]
+local function sortedIds(counts)
+    local ids = {}
+    for id in pairs(counts or {}) do table.insert(ids, id) end
+    table.sort(ids)
+    return ids
+end
+BZ.sortedIds = sortedIds
+
 function BZ.Serialize(name, entry)
     local out = { BZ.FILE_MAGIC }
     table.insert(out, "M~" .. name .. "~" .. (entry.realm or "") .. "~" ..
@@ -351,11 +388,11 @@ function BZ.Serialize(name, entry)
     end
     if entry.money then table.insert(out, "G~" .. entry.money) end
     if entry.class then table.insert(out, "C~" .. entry.class) end
-    for id, count in pairs(entry.bags or {}) do
-        table.insert(out, "B~" .. id .. "~" .. count)
+    for _, id in ipairs(sortedIds(entry.bags)) do
+        table.insert(out, "B~" .. id .. "~" .. entry.bags[id])
     end
-    for id, count in pairs(entry.bank or {}) do
-        table.insert(out, "K~" .. id .. "~" .. count)
+    for _, id in ipairs(sortedIds(entry.bank)) do
+        table.insert(out, "K~" .. id .. "~" .. entry.bank[id])
     end
     return table.concat(out, "\n") .. "\n"
 end
@@ -432,8 +469,38 @@ function BZ.RosterNames()
     return names
 end
 
---- Write this character's own file. Nothing else ever writes it.
-function BZ.WriteOwn()
+--[[ Everything about this character another client would act on, and nothing
+     that moves on its own.
+
+     `time` is deliberately absent. It is refreshed on every rescan, so a key
+     that included it would differ every time and report a change whenever the
+     game so much as fired BAG_UPDATE -- which is exactly the noise this is
+     here to remove. What the key says is "the contents are the same", and a
+     file whose contents are the same is not worth rewriting. ]]
+function BZ.ContentKey(name, entry)
+    return table.concat({
+        name, entry.realm or "", entry.account or "",
+        tostring(entry.money or ""), entry.class or "",
+        BZ.PackCounts(entry.bags), BZ.PackCounts(entry.bank),
+    }, "~|~")
+end
+
+--[[ Write this character's own file. Nothing else ever writes it.
+
+     Skipped when the contents have not moved since the last write, because
+     the events that bring us here have not the faintest idea whether anything
+     changed: PLAYER_MONEY fires when you are paid the same copper you just
+     spent, BAG_UPDATE fires several times for one loot, and opening the bank
+     rescans the lot. Each of those used to be a full rewrite that every other
+     client then re-read and re-parsed.
+
+     `force` writes regardless, and logging in uses it. The timestamp in the
+     file is how `/bz forget` tells a character who has come back from one
+     that is still gone, so a character has to be able to say "I was here"
+     even when its bags are exactly as it left them. Leaving that to the key
+     starting out unset would have worked by accident, and only for as long
+     as nothing else ever wrote before login. ]]
+function BZ.WriteOwn(force)
     local me = BZ.Me()
     local entry = me and BZ.data[me]
     if not entry then return false end
@@ -447,8 +514,16 @@ function BZ.WriteOwn()
     else
         entry.account = nil
     end
+
+    local key = BZ.ContentKey(me, entry)
+    if not force and BZ.lastContent and key == BZ.lastContent then
+        BZ.Debug("own file unchanged - not rewriting it")
+        return true
+    end
+
     if writeFile(BZ.FileFor(me), BZ.Serialize(me, entry)) then
         BZ.lastWrite = time()
+        BZ.lastContent = key
         BZ.RetireLegacyFile()
         return true
     end
@@ -464,17 +539,36 @@ end
 
      Our own file is skipped: the copy in memory is newer than anything on
      disk by definition, and re-reading it would replace a live scan with a
-     snapshot from up to five seconds ago. ]]
+     snapshot from up to five seconds ago.
+
+     A file whose text has not changed since we last parsed it is not parsed
+     again. This is the other half of the write side's check, and it is the
+     one that costs: this runs every twenty seconds for every character you
+     have ever logged in, forever, and almost every time the answer is that
+     nobody has touched a bag. Reading the text is unavoidable -- Lua here
+     cannot ask when a file was modified, only what is in it -- but comparing
+     one string beats rebuilding a few hundred item rows per character.
+
+     The cache is only trusted while we still hold the character it produced,
+     so anything that empties BZ.data -- `/bz clear` above all -- gets a real
+     parse rather than a confident zero. ]]
 function BZ.ReadOthers()
     if not BZ.FileAPI() then
         BZ.fileState = "no file API - this needs Nampower"
         return 0
     end
 
-    local me, realm, found = BZ.Me(), GetRealmName() or "", 0
+    local me, realm = BZ.Me(), GetRealmName() or ""
     local forgotten = BZ.config.forgotten or {}
-    local fresh = {}
+    --[[ Which files could speak for which character, and how many each has.
 
+         Normally one apiece. A character that has not logged in since 2.0.0
+         can have two -- the old name and the realm-tagged one -- and for
+         those the cache below is skipped, because deciding which of two files
+         is the newer one means actually looking at both. That is a handful of
+         characters for one session each, against every character you own for
+         the rest of time, so the fast path is the one worth having. ]]
+    local candidates, howMany = {}, {}
     for _, r in ipairs(BZ.Roster()) do
         --[[ Another realm's characters never enter memory. Their items are out
              of reach from here, and a character of the same name there would
@@ -484,19 +578,51 @@ function BZ.ReadOthers()
             local path
             if r.realm == "" then path = BZ.LegacyFileFor(r.name)
             else path = BZ.FileFor(r.name, r.realm) end
-            local parsed, entry = BZ.Deserialize(readFile(path))
-            if parsed and parsed ~= me and (entry.realm or "") == realm then
-                local gone = forgotten[parsed]
-                if gone and (entry.time or 0) <= gone then
-                    -- Forgotten with /bz forget, and not logged in since.
-                elseif not fresh[parsed] or
-                       (entry.time or 0) > (fresh[parsed].time or 0) then
-                    -- A file newer than the forgetting means they logged in
-                    -- again, so they are plainly not deleted.
-                    if gone then forgotten[parsed] = nil end
-                    -- Newest wins: during the move from 2.0.0 one character
-                    -- can have a file under both names.
-                    fresh[parsed] = entry
+            table.insert(candidates, { name = r.name, path = path })
+            howMany[r.name] = (howMany[r.name] or 0) + 1
+        end
+    end
+
+    --[[ `fresh` is what has to be installed, `held` every name this pass
+         accounts for -- parsed or not -- so the count is per character rather
+         than per file. ]]
+    local fresh, held = {}, {}
+
+    for _, candidate in ipairs(candidates) do
+        do
+            local path = candidate.path
+            local text = readFile(path)
+            local cached = BZ.lastRead[path]
+
+            --[[ The held entry must still BE what the file said, not merely
+                 exist. Something else can have replaced it since -- the
+                 channel used to, and silently cost the character its gold --
+                 and a cache that only checked for presence would then go on
+                 skipping the file that would have put it right. ]]
+            local still = cached and cached.name and BZ.data[cached.name]
+            if howMany[candidate.name] == 1 and cached and cached.text == text
+               and still and still.fromFile then
+                -- Byte for byte what we parsed last time, this is the only
+                -- file that speaks for them, and what we hold still came from
+                -- it. There is nothing in it left to learn.
+                held[cached.name] = true
+            else
+                local parsed, entry = BZ.Deserialize(text)
+                BZ.lastRead[path] = { text = text, name = parsed }
+
+                if parsed and parsed ~= me and (entry.realm or "") == realm then
+                    local gone = forgotten[parsed]
+                    if gone and (entry.time or 0) <= gone then
+                        -- Forgotten with /bz forget, and not logged in since.
+                    elseif not fresh[parsed] or
+                           (entry.time or 0) > (fresh[parsed].time or 0) then
+                        -- A file newer than the forgetting means they logged in
+                        -- again, so they are plainly not deleted.
+                        if gone then forgotten[parsed] = nil end
+                        -- Newest wins: during the move from 2.0.0 one character
+                        -- can have a file under both names.
+                        fresh[parsed] = entry
+                    end
                 end
             end
         end
@@ -511,8 +637,11 @@ function BZ.ReadOthers()
              looks right is the worst kind. ]]
         entry.fromFile = time()
         BZ.data[name] = entry
-        found = found + 1
+        held[name] = true
     end
+
+    local found = 0
+    for _ in pairs(held) do found = found + 1 end
 
     Bagertz_Data = BZ.data
     BZ.fileState = found .. " character file(s) read"
@@ -559,8 +688,8 @@ end
      Serialize the second definition silently replaced the first. ]]
 function BZ.PackCounts(counts)
     local parts = {}
-    for id, count in pairs(counts or {}) do
-        table.insert(parts, id .. ":" .. count)
+    for _, id in ipairs(BZ.sortedIds(counts)) do
+        table.insert(parts, id .. ":" .. counts[id])
     end
     return table.concat(parts, ",")
 end
@@ -574,21 +703,62 @@ function BZ.UnpackCounts(str)
     return counts
 end
 
--- One character: "Name=<bags>;<bank>", where each half is "id:count,id:count".
--- Several characters: blocks joined with "!". Every separator is part of
--- BZ.ALPHABET so it's rotated along with the data rather than standing out as
--- plaintext structure in an otherwise obfuscated payload.
-function BZ.SerializeEntry(name, entry)
-    return name .. "=" .. BZ.PackCounts(entry.bags) .. ";" .. BZ.PackCounts(entry.bank)
+--[[ What changed between what they know and what is true now, as counts to
+     set. A count of zero means the item is gone -- free as a sentinel, since
+     a scan only ever records items that are actually there.
+
+     Returns nil when nothing moved, which is the common case and the whole
+     reason this exists. ]]
+function BZ.DiffCounts(known, current)
+    local out, any = {}, false
+    known = known or {}
+    current = current or {}
+    for id, count in pairs(current) do
+        if known[id] ~= count then
+            out[id] = count
+            any = true
+        end
+    end
+    for id in pairs(known) do
+        if current[id] == nil then
+            out[id] = 0
+            any = true
+        end
+    end
+    if not any then return nil end
+    return out
 end
 
-function BZ.SerializePayload(names)
-    local blocks = {}
-    for _, name in ipairs(names) do
-        local entry = BZ.data[name]
-        if entry then table.insert(blocks, BZ.SerializeEntry(name, entry)) end
+--[[ Changes laid over what we already hold. Zero removes, anything else
+     sets; an item the changes do not mention is left exactly as it was, which
+     is the entire difference between this format and the one before it. ]]
+function BZ.ApplyCounts(known, changes)
+    local out = BZ.CopyCounts(known)
+    for id, count in pairs(changes or {}) do
+        if count == 0 then out[id] = nil else out[id] = count end
     end
-    return table.concat(blocks, "!")
+    return out
+end
+
+--- A plain copy, so a later scan replacing the table cannot quietly rewrite
+--- our record of what the far end was told.
+function BZ.CopyCounts(counts)
+    local out = {}
+    for id, count in pairs(counts or {}) do out[id] = count end
+    return out
+end
+
+--[[ One character: "Name=<bags>;<bank>", where each half is
+     "id:count,id:count". Several characters: blocks joined with "!". Every
+     separator is part of BZ.ALPHABET so it is rotated along with the data
+     rather than standing out as plaintext structure in an otherwise
+     obfuscated payload.
+
+     Takes the counts rather than reading them off the entry, because what
+     goes in a block is not always what the character is holding -- for a
+     difference it is only the part of it that moved. ]]
+function BZ.SerializeEntry(name, bags, bank)
+    return name .. "=" .. BZ.PackCounts(bags) .. ";" .. BZ.PackCounts(bank)
 end
 
 -- Returns a list of { name, bags, bank }.
@@ -646,6 +816,22 @@ function BZ.ChannelsForPeers()
     return channels
 end
 
+--[[ Where the beacon goes: the channels a paired box has actually been heard
+     on, as long as they are still channels we are on, and otherwise all of
+     them. A party that has since broken up is remembered for up to a minute,
+     and a beacon sent into it would simply go nowhere. ]]
+function BZ.BeaconChannels()
+    local available = {}
+    for _, channel in ipairs(BZ.Channels()) do available[channel] = true end
+
+    local narrowed = {}
+    for _, channel in ipairs(BZ.ChannelsForPeers()) do
+        if available[channel] then table.insert(narrowed, channel) end
+    end
+    if table.getn(narrowed) > 0 then return narrowed end
+    return BZ.Channels()
+end
+
 function BZ.Queue(msg, channel)
     table.insert(BZ.sendQueue, { msg = msg, channel = channel })
 end
@@ -665,10 +851,16 @@ function BZ.SendBeacon()
     local nonce = math.random(100000, 999999)
     local tag = BZ.Tag(nonce)
     if not tag then return end
-    -- Beacons go out on every reachable channel, since that's how the two boxes
-    -- find each other in the first place. They're a few bytes and say only
-    -- "someone here runs this addon".
-    local channels = BZ.Channels()
+    --[[ Every reachable channel until the other box answers, since that is
+         how the two find each other in the first place -- but only the
+         channel it answered on after that.
+
+         The difference shows up in a guild. Beacons are a few bytes, and
+         twenty seconds apart they are nothing much; sent to several hundred
+         people for as long as you are logged in, when the box you are talking
+         to is standing in your party, they are a few bytes nobody asked
+         for. ]]
+    local channels = BZ.BeaconChannels()
     for _, channel in ipairs(channels) do
         BZ.Queue("B~" .. nonce .. "~" .. tag .. "~" .. BZ.Me(), channel)
     end
@@ -698,15 +890,17 @@ function BZ.OwnedCharacters()
     return names
 end
 
--- scope "all" sends every character on this account; anything else sends only
--- the one logged in.
---
--- The two exist because they answer different needs. Meeting the other box, or
--- asking for a sync, should hand over the whole roster - that's the entire
--- point, since the other characters aren't online to speak for themselves. But
--- a bag change only ever concerns the character who made it, and re-sending
--- five characters' inventories every time you loot something would be pure
--- waste.
+--[[ scope "all" sends every character on this account, in full; anything else
+     sends what has changed about the one logged in, and nothing at all if
+     that is nothing.
+
+     The two answer different needs. Meeting the other box, or being asked for
+     a sync, has to hand over the whole roster -- that is the entire point,
+     since the other characters are not online to speak for themselves. A bag
+     change concerns one character and usually one item, and used to go out as
+     a retransmission of that character's entire inventory, chunked into as
+     many messages as it took, every few seconds for as long as you kept
+     moving things about. ]]
 function BZ.SendInventory(scope)
     local password = BZ.config.password
     if not password or password == "" then
@@ -723,16 +917,71 @@ function BZ.SendInventory(scope)
         return
     end
 
-    local me = BZ.Me()
-    local names
-    if scope == "all" then
-        names = BZ.OwnedCharacters()
-    elseif BZ.data[me] then
-        names = { me }
-    else
-        names = {}
-    end
+    --[[ Every character this machine speaks for, either way. It used to be
+         only the one logged in unless the whole roster was asked for, which
+         left a partner's view of your alts frozen at whatever it was when the
+         two boxes first met: an alt that played on the other account later
+         was read out of the folder here and never mentioned onward.
+
+         Including them costs nothing now. A character nothing has happened to
+         produces no block at all, so the usual send is still one item on one
+         character. ]]
+    local names = BZ.OwnedCharacters()
     if table.getn(names) == 0 then return end
+
+    local full = (scope == "all")
+
+    --[[ A difference has to be measured against something, and what the far
+         end has been told is the only honest candidate. A character they have
+         never heard of has no such record, so there is nothing to subtract --
+         and a "difference" that was really a whole inventory would be MERGED
+         into whatever they hold, leaving behind every item we have since got
+         rid of. So the whole lot goes instead, which replaces rather than
+         merges.
+
+         Reached after a reload that was close enough to keep the other box
+         out of the stale list, and whenever an alt turns up that they have
+         not been told about. Once each, not repeatedly. ]]
+    if not full then
+        for _, name in ipairs(names) do
+            if not BZ.lastSent[name] then
+                BZ.Debug("nothing on record as sent for " .. name ..
+                    " - sending everything instead of a difference")
+                full = true
+            end
+        end
+    end
+
+    --[[ What actually goes on the wire, per character. A baseline is the lot;
+         a difference is what changed since they were last told, and an empty
+         one means there is nothing to say and no message to send. ]]
+    local sending, blocks = {}, {}
+    for _, name in ipairs(names) do
+        local entry = BZ.data[name]
+        if entry then
+            local bags, bank
+            if full then
+                bags, bank = entry.bags or {}, entry.bank or {}
+            else
+                local known = BZ.lastSent[name] or {}
+                bags = BZ.DiffCounts(known.bags, entry.bags)
+                bank = BZ.DiffCounts(known.bank, entry.bank)
+            end
+            if full or bags or bank then
+                table.insert(sending, name)
+                table.insert(blocks, BZ.SerializeEntry(name, bags, bank))
+            end
+        end
+    end
+
+    if table.getn(sending) == 0 then
+        --[[ Nothing moved. Cleared here rather than left set, or every beacon
+             from now until something does change recomputes the same empty
+             difference. ]]
+        BZ.inventoryDirty = false
+        BZ.Debug("nothing has changed since the last send - saying nothing")
+        return
+    end
 
     local nonce = math.random(100000, 999999)
     -- Resolve the tag before building anything. Without this the no-password
@@ -742,27 +991,69 @@ function BZ.SendInventory(scope)
     local tag = BZ.Tag(nonce)
     if not tag then return end
 
-    local payload = BZ.Crypt(BZ.SerializePayload(names), nonce, false)
+    local payload = BZ.Crypt(table.concat(blocks, "!"), nonce, false)
 
     local total = math.ceil(string.len(payload) / BZ.MAX_PAYLOAD)
     if total < 1 then total = 1 end
 
+    BZ.sendSerial = BZ.sendSerial + 1
+    local serial = BZ.sendSerial
+
     for _, channel in ipairs(channels) do
-        -- The "2" is the wire format version. A client that doesn't recognise it
-        -- ignores the whole transfer rather than half-parsing a format it
-        -- doesn't understand and storing nonsense.
-        BZ.Queue("H~2~" .. nonce .. "~" .. tag .. "~" ..
-            (BZ.config.account or "") .. "~" .. total, channel)
+        --[[ The "3" is the wire format version. A client that does not
+             recognise it ignores the whole transfer rather than half-parsing
+             a format it does not understand and storing nonsense -- which is
+             exactly what a 2 reading a delta would do, since the two formats
+             differ only in what an absent item means.
+
+             The mode says whether this replaces what they hold or adjusts it,
+             and the serial lets them notice a transfer that never arrived
+             instead of adjusting from the wrong starting point. ]]
+        BZ.Queue("H~3~" .. nonce .. "~" .. tag .. "~" ..
+            (BZ.config.account or "") .. "~" .. total .. "~" ..
+            (full and "F" or "D") .. "~" .. serial, channel)
         for i = 1, total do
             local from = (i - 1) * BZ.MAX_PAYLOAD + 1
             BZ.Queue("D~" .. nonce .. "~" .. i .. "~" ..
                 string.sub(payload, from, from + BZ.MAX_PAYLOAD - 1), channel)
         end
     end
+
+    --[[ Recorded as told, so the next difference is measured from here.
+
+         Deliberately the character's whole contents and not the delta: what
+         the far end holds after applying it is the same either way, and
+         keeping the absolute figures means one dropped transfer costs a
+         resync rather than quietly biasing every delta after it. ]]
+    for _, name in ipairs(sending) do
+        local entry = BZ.data[name]
+        BZ.lastSent[name] = {
+            bags = BZ.CopyCounts(entry.bags),
+            bank = BZ.CopyCounts(entry.bank),
+        }
+    end
+
     BZ.inventoryDirty = false
     BZ.lastInventorySend = time()
-    BZ.Debug("queued " .. table.getn(names) .. " character(s) in " .. total .. " chunk(s), " ..
+    BZ.Debug("queued " .. (full and "all of " or "changes to ") ..
+        table.getn(sending) .. " character(s) in " .. total .. " chunk(s), " ..
         string.len(payload) .. " chars, to " .. table.concat(channels, "+"))
+end
+
+--[[ "Start me again from scratch." Sent when a delta cannot be trusted --
+     because it is about somebody we have never heard of, or because the one
+     before it never arrived. Rate-limited, since a transfer in flight will
+     produce several of these before the answer gets back. ]]
+function BZ.AskForBaseline(channel)
+    if not BZ.config.password or BZ.config.password == "" then return end
+    if BZ.lastBaselineAsk and
+       (time() - BZ.lastBaselineAsk) < BZ.MIN_RESEND_INTERVAL then return end
+    local nonce = math.random(100000, 999999)
+    local tag = BZ.Tag(nonce)
+    if not tag then return end
+    BZ.lastBaselineAsk = time()
+    BZ.Queue("R~" .. nonce .. "~" .. tag, channel or BZ.Channel())
+    BZ.Debug("asked for a full resend")
 end
 
 -- ---------------------------------------------------------------------------------------------
@@ -823,14 +1114,43 @@ function BZ.OnAddonMessage(msg, sender)
             BZ.SendInventory()
         end
 
-    elseif kind == "H" then
-        local _, _, version, nonce, tag, account, total =
-            string.find(rest, "^(%d+)~(%d+)~(%d+)~([^~]*)~(%d+)$")
+    elseif kind == "R" then
+        --[[ They cannot use a difference and want the lot. Password-checked
+             like everything else, or anyone in the channel could make us
+             broadcast on demand. ]]
+        local _, _, nonce, tag = string.find(rest, "^(%d+)~(%d+)$")
         if not nonce then return end
-        if version ~= "2" then
+        if tag ~= BZ.Tag(nonce) then
             BZ.stats.rejected = BZ.stats.rejected + 1
-            BZ.Debug("wire format v" .. tostring(version) .. " from " .. tostring(sender) ..
-                " - update both boxes to the same version")
+            BZ.Debug("resend request from " .. tostring(sender) ..
+                " failed the password check - ignored")
+            return
+        end
+        BZ.Debug(tostring(sender) .. " asked for a full resend")
+        BZ.SendInventory("all")
+
+    elseif kind == "H" then
+        local _, _, version, nonce, tag, account, total, mode, serial =
+            string.find(rest, "^(%d+)~(%d+)~(%d+)~([^~]*)~(%d+)~(%a)~(%d+)$")
+        if not nonce then return end
+        if version ~= "3" then
+            BZ.stats.rejected = BZ.stats.rejected + 1
+            --[[ Said out loud, not merely logged. The symptom of a mismatch
+                 is a partner whose counts quietly stop moving, which looks
+                 like nothing at all; and 2.2.0 changed the format, so one box
+                 updated and the other not is the likely way to meet it.
+
+                 Once per partner per session. It is a thing to go and fix,
+                 not a thing to be told every twenty seconds. ]]
+            if not BZ.warnedVersion then BZ.warnedVersion = {} end
+            if not BZ.warnedVersion[sender] then
+                BZ.warnedVersion[sender] = true
+                BZ.Say("|cFFFF5179" .. tostring(sender) .. " is running a different " ..
+                    "version of Bagertz|r, so nothing they send can be read. " ..
+                    "You are on |cFFFFFFFF" .. tostring(BZ.VERSION) .. "|r - " ..
+                    "both of you need the same one.")
+            end
+            BZ.Debug("wire format v" .. tostring(version) .. " from " .. tostring(sender))
             return
         end
         if tag ~= BZ.Tag(nonce) then
@@ -841,8 +1161,10 @@ function BZ.OnAddonMessage(msg, sender)
         BZ.incoming[sender] = {
             nonce = nonce, account = account,
             expected = tonumber(total), chunks = {},
+            mode = mode, serial = tonumber(serial),
         }
-        BZ.Debug("incoming transfer from " .. tostring(sender) .. " (" .. total .. " chunks)")
+        BZ.Debug("incoming " .. (mode == "F" and "full" or "partial") ..
+            " transfer from " .. tostring(sender) .. " (" .. total .. " chunks)")
 
     elseif kind == "D" then
         local _, _, nonce, index, data = string.find(rest, "^(%d+)~(%d+)~(.*)$")
@@ -863,42 +1185,121 @@ function BZ.OnAddonMessage(msg, sender)
             joined = joined .. (pending.chunks[i] or "")
         end
         local characters = BZ.DeserializePayload(BZ.Crypt(joined, pending.nonce, true))
-        local updated = {}
+        BZ.incoming[sender] = nil
+
+        local full = (pending.mode == "F")
+        local serial = pending.serial or 0
+        local lastSerial = BZ.peerSerial[sender] or 0
+        local peer = BZ.peers[sender]
+
+        --[[ A difference only means anything applied to the state it was
+             measured against, so a transfer that never arrived cannot simply
+             be shrugged off: the counts that follow would all be adjusted
+             from the wrong starting point and would look perfectly
+             reasonable. Hence the serial, and hence asking for the lot rather
+             than guessing.
+
+             A full transfer needs none of this -- it replaces rather than
+             adjusts -- and resets the count, which is what makes asking for
+             one a way out. ]]
+        if not full then
+            if serial <= lastSerial then
+                -- Already applied. The same transfer arrives twice whenever
+                -- the far end can reach us on two channels at once.
+                BZ.Debug("transfer " .. serial .. " from " .. tostring(sender) ..
+                    " is one we already have")
+                return
+            end
+            if serial > lastSerial + 1 then
+                BZ.Debug("transfer " .. serial .. " from " .. tostring(sender) ..
+                    " follows one that never arrived - asking for the lot")
+                BZ.AskForBaseline(peer and peer.channel)
+                return
+            end
+        end
+
+        local updated, needBaseline = {}, false
 
         for _, incoming in ipairs(characters) do
             local nBank = 0
             for _ in pairs(incoming.bank or {}) do nBank = nBank + 1 end
 
-            local entry = BZ.data[incoming.name] or {}
-            entry.realm   = GetRealmName()
-            entry.time    = time()
-            entry.account = (pending.account ~= "" and pending.account) or entry.account
-            entry.bags    = incoming.bags
-            -- Never flagged mine: a character learned from the other box belongs
-            -- to that account, and relaying it back would create an echo whose
-            -- staleness we'd then have to arbitrate against the original.
-            --[[ Never flagged as ours: a character learned from the other box
-                 belongs to that account, and relaying it back would create an
-                 echo whose staleness we would then have to arbitrate against
-                 the original. The stamp is what keeps /bz honest about which
-                 of three places a count came from. ]]
-            entry.mine     = nil
-            entry.fromFile = nil
-            entry.fromChannel = time()
-            -- Only replace a known bank with a non-empty one: the sender may not
-            -- have visited a bank yet, and an empty section shouldn't erase what
-            -- we already had.
-            if nBank > 0 then
-                entry.bank = incoming.bank
-                entry.bankTime = time()
-            end
+            local entry = BZ.data[incoming.name]
 
-            BZ.data[incoming.name] = entry
-            table.insert(updated, BZ.DisplayName(incoming.name))
+            --[[ A character we can read out of our own folder has nothing to
+                 learn from the channel, and a great deal to lose by it.
+
+                 Two accounts on one machine share the folder. Link them over
+                 the channel as well and each relays what it read from the
+                 folder to the other -- which is right for a partner on another
+                 PC, who has no folder access, and is a pure echo here. Applying
+                 that echo replaces a local, authoritative entry with a wire one
+                 that carries bags and bank but NO GOLD, and the entry stops
+                 counting toward /bz gold the moment it arrives.
+
+                 So the folder wins. It is local truth, written by the character
+                 itself, and it is strictly more complete than anything the wire
+                 can carry. ]]
+            if entry and (entry.mine or entry.fromFile) then
+                BZ.Debug("ignoring channel data for " .. tostring(incoming.name) ..
+                    " - we have their file")
+            elseif not full and not entry then
+                --[[ Changes to somebody we have never heard of. There is
+                     nothing here to apply them to, and a character invented
+                     out of whichever few items happened to move would be
+                     wrong in a way that looks right. ]]
+                BZ.Debug("changes for " .. tostring(incoming.name) ..
+                    ", who we have never been told about - asking for the lot")
+                needBaseline = true
+            else
+                entry = entry or {}
+                entry.realm   = GetRealmName()
+                entry.time    = time()
+                entry.account = (pending.account ~= "" and pending.account) or entry.account
+
+                if full then
+                    entry.bags = incoming.bags
+                else
+                    entry.bags = BZ.ApplyCounts(entry.bags, incoming.bags)
+                end
+
+                --[[ Never flagged as ours: a character learned from the other
+                     box belongs to that account, and relaying it back would
+                     create an echo whose staleness we would then have to
+                     arbitrate against the original. The stamp is what keeps
+                     /bz honest about which of three places a count came
+                     from. ]]
+                entry.mine     = nil
+                entry.fromFile = nil
+                entry.fromChannel = time()
+
+                --[[ An empty bank section is left alone either way, and means
+                     the same thing in both: for a full transfer the sender
+                     has not visited a bank, for a difference nothing in the
+                     bank moved. Neither is a reason to erase what we hold. ]]
+                if nBank > 0 then
+                    if full then
+                        entry.bank = incoming.bank
+                    else
+                        entry.bank = BZ.ApplyCounts(entry.bank, incoming.bank)
+                    end
+                    entry.bankTime = time()
+                end
+
+                BZ.data[incoming.name] = entry
+                table.insert(updated, BZ.DisplayName(incoming.name))
+            end
+        end
+
+        --[[ Only moved on for a transfer we could actually use. Left where it
+             is otherwise, so the next one reads as a gap and asks again. ]]
+        if needBaseline then
+            BZ.AskForBaseline(peer and peer.channel)
+        else
+            BZ.peerSerial[sender] = serial
         end
 
         Bagertz_Data = BZ.data
-        BZ.incoming[sender] = nil
         if table.getn(updated) > 0 then
             BZ.Say("updated " .. table.getn(updated) .. " character(s): " ..
                 table.concat(updated, ", "))
@@ -1013,20 +1414,44 @@ end
      still sending, still believing it is linked, and wondering why nothing
      comes back. Their characters go too, because what is left behind would be
      a frozen snapshot that looks exactly like live data. ]]
+--[[ Stop using the channel.
+
+     Keyed on the PASSWORD, not on the partner record. The password is the
+     thing that actually switches the channel on -- every send path refuses
+     without one and every receive path ignores what arrives -- while the
+     partner record is only who we think we agreed it with.
+
+     The two come apart. A password set by hand under the pre-2.0 sync has no
+     partner record at all, and the earlier version of this bailed out on that
+     and told the player they were not linked while their client went on
+     broadcasting. There was then no way to turn it off from the UI. ]]
 function BZ.Unlink()
     local partner = BZ.config.partner
-    if not partner then
+    local password = BZ.config.password
+    local linked = password and password ~= ""
+
+    if not partner and not linked then
         BZ.Say("not linked to anyone.")
         return
     end
 
-    whisperTo(partner.name, BZ.PAIR_END)
+    -- Only someone we actually agreed with can be told; a leftover password
+    -- has nobody on the other end to notify.
+    if partner then whisperTo(partner.name, BZ.PAIR_END) end
+
     BZ.ForgetChannelData()
     BZ.config.password = nil
     BZ.config.partner = nil
     Bagertz_Config = BZ.config
-    BZ.Say("unlinked from |cFFFFFFFF" .. partner.name .. "|r. Nothing is sent " ..
-        "or accepted over the channel any more.")
+
+    if partner then
+        BZ.Say("unlinked from |cFFFFFFFF" .. partner.name .. "|r. Nothing is sent " ..
+            "or accepted over the channel any more.")
+    else
+        BZ.Say("cleared a leftover channel password. Nothing is sent or " ..
+            "accepted over the channel any more. |cff888888Your own accounts " ..
+            "share the folder and never needed it.|r")
+    end
     BZ.RefreshPairPanel()
 end
 
@@ -1220,6 +1645,13 @@ function BZ.BuildPairPanel()
     f.title = label(f, 13, 1, 0.8, 0.4)
     f.title:SetPoint("TOP", f, "TOP", 0, -12)
     f.title:SetText("Bagertz - sharing with another PC")
+
+    --[[ On the panel because this is where two people look when the sharing
+         is not working, and "are we both on the same version" is the question
+         it most often turns out to be. ]]
+    f.version = label(f, 10, 0.5, 0.53, 0.6)
+    f.version:SetPoint("TOPRIGHT", f, "TOPRIGHT", -12, -12)
+    f.version:SetText("v" .. tostring(BZ.VERSION))
 
     f.state = label(f, 11)
     f.state:SetWidth(292)
@@ -1650,12 +2082,22 @@ SlashCmdList["BAGERTZ"] = function(msg)
         BZ.PrintGold()
 
     elseif cmd == "read" or cmd == "sync" then
-        -- "sync" kept as a word people will reach for out of habit; there is
-        -- nothing to synchronise any more, only a folder to re-read.
+        -- "sync" kept as a word people will reach for out of habit; for the
+        -- folder there is nothing to synchronise, only a folder to re-read.
         BZ.JoinRoster()
         BZ.UpdateOwnData()
         local n = BZ.ReadOthers()
         BZ.Say("re-read the shared folder: " .. n .. " other character(s).")
+        --[[ For a link there is: ordinary sends only carry what changed, so
+             this is the way to put a partner who has drifted back on the same
+             footing without unlinking. It should not be needed -- a missed
+             transfer is noticed and asked about -- but "should not be needed"
+             is a poor thing to leave someone holding. ]]
+        if BZ.config.password and BZ.config.password ~= "" then
+            BZ.lastSent = {}
+            BZ.SendInventory("all")
+            BZ.Say("and sent your partner everything, not just what changed.")
+        end
 
     elseif cmd == "forget" and words[2] then
         local target
@@ -1898,6 +2340,10 @@ ev:SetScript("OnEvent", function()
     elseif event == "PLAYER_ENTERING_WORLD" then
         BZ.JoinRoster()
         BZ.UpdateOwnData()
+        -- Forced, because this is the one write whose point is the timestamp
+        -- rather than the contents: it is how a character that was forgotten
+        -- says it is still being played.
+        BZ.WriteOwn(true)
         BZ.ReadOthers()
         BZ.HookBagshui()
 
